@@ -1,0 +1,184 @@
+import { NextRequest } from "next/server";
+import { spawn } from "child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import path from "path";
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
+import { pythonInterpreter, SCRIPTS_DIR } from "../_lib/spawn-python";
+import { register } from "../_lib/multicam-store";
+
+export const runtime = "nodejs";
+export const maxDuration = 3600;
+export const dynamic = "force-dynamic";
+
+const SCRIPT_PATH = path.join(SCRIPTS_DIR, "multicam_pipeline.py");
+
+interface ExportSegment {
+  title: string;
+  start: number;
+  end: number;
+}
+
+interface Body {
+  acamPath?: unknown;
+  bcamPath?: unknown;
+  ccamPath?: unknown;
+  segments?: unknown;
+}
+
+function basename(p: string): string {
+  const name = p.split("/").pop() ?? "output";
+  return name.replace(/\.\w+$/, "") || "output";
+}
+
+export async function POST(req: NextRequest) {
+  let body: Body;
+  try {
+    body = (await req.json()) as Body;
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const { acamPath, bcamPath, ccamPath, segments } = body;
+
+  if (typeof acamPath !== "string" || !existsSync(acamPath)) {
+    return new Response(JSON.stringify({ error: `A-cam not found: ${String(acamPath)}` }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const hasB = typeof bcamPath === "string" && bcamPath.length > 0;
+  const hasC = typeof ccamPath === "string" && ccamPath.length > 0;
+  if (!hasB && !hasC) {
+    return new Response(JSON.stringify({ error: "Provide at least one of bcamPath / ccamPath" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (hasB && !existsSync(bcamPath as string)) {
+    return new Response(JSON.stringify({ error: `B-cam not found: ${bcamPath}` }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (hasC && !existsSync(ccamPath as string)) {
+    return new Response(JSON.stringify({ error: `C-cam not found: ${ccamPath}` }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return new Response(JSON.stringify({ error: "No segments" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const exportSegments: ExportSegment[] = (segments as ExportSegment[]).map((s) => ({
+    title: String(s.title ?? ""),
+    start: Number(s.start),
+    end: Number(s.end),
+  }));
+
+  const runId = randomUUID();
+  const workDir = mkdtempSync(path.join(tmpdir(), `multicam-export-${runId}-`));
+  const segmentsPath = path.join(workDir, "segments.json");
+  const outdir = path.join(workDir, "out");
+  const zipPath = path.join(tmpdir(), `multicam-zip-${runId}.zip`);
+  writeFileSync(segmentsPath, JSON.stringify(exportSegments));
+
+  const baseFilename = `${basename(acamPath)}_multicam.zip`;
+
+  const args = [
+    SCRIPT_PATH,
+    "--acam", acamPath,
+    "--segments", segmentsPath,
+    "--outdir", outdir,
+    "--zip-out", zipPath,
+  ];
+  if (hasB) args.push("--bcam", bcamPath as string);
+  if (hasC) args.push("--ccam", ccamPath as string);
+
+  const cleanup = () => {
+    try { rmSync(workDir, { recursive: true, force: true }); } catch {}
+  };
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = (obj: unknown) => {
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+        } catch {}
+      };
+
+      const proc = spawn(pythonInterpreter(), args, { env: { ...process.env } });
+
+      let stderrBuffer = "";
+      let stdoutBuffer = "";
+
+      const keepalive = setInterval(() => {
+        try { controller.enqueue(encoder.encode(`: keepalive\n\n`)); } catch {}
+      }, 10000);
+
+      proc.stdout.on("data", (data: Buffer) => {
+        stdoutBuffer += data.toString();
+        const parts = stdoutBuffer.split("\n");
+        stdoutBuffer = parts.pop() ?? "";
+        for (const line of parts) {
+          if (line.trim()) {
+            controller.enqueue(encoder.encode(`data: ${line}\n\n`));
+          }
+        }
+      });
+
+      proc.stderr.on("data", (data: Buffer) => {
+        const text = data.toString();
+        stderrBuffer += text;
+        process.stderr.write(`[multicam_pipeline.py stderr] ${text}`);
+        send({ stderr: text.trim() });
+      });
+
+      proc.on("close", (code) => {
+        clearInterval(keepalive);
+        if (stdoutBuffer.trim()) {
+          controller.enqueue(encoder.encode(`data: ${stdoutBuffer}\n\n`));
+          stdoutBuffer = "";
+        }
+        console.log(`[multicam_pipeline.py] exited with code ${code}`);
+        if (code === 0 && existsSync(zipPath)) {
+          const downloadId = register(zipPath, baseFilename);
+          send({ status: "ready", downloadId, filename: baseFilename });
+        } else {
+          send({
+            error: `Pipeline exited with code ${code}. ${stderrBuffer.slice(-500)}`,
+          });
+          if (existsSync(zipPath)) {
+            try { rmSync(zipPath, { force: true }); } catch {}
+          }
+        }
+        cleanup();
+        controller.close();
+      });
+
+      proc.on("error", (err) => {
+        clearInterval(keepalive);
+        send({ error: err.message });
+        cleanup();
+        controller.close();
+      });
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}

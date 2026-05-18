@@ -1,0 +1,340 @@
+"use client";
+
+import { useState } from "react";
+import { SegmentGroup } from "@/lib/types";
+
+interface Props {
+  segments: SegmentGroup[];
+  filePath: string;
+  bcamPath: string;
+  ccamPath: string;
+}
+
+function fmtTime(s: number): string {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+function isFiller(title: string): boolean {
+  return /^\s*filler\b/i.test(title);
+}
+
+interface SegmentResult {
+  index: number;
+  available: string[];
+  error?: string;
+}
+
+export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPath }: Props) {
+  const [includeFiller, setIncludeFiller] = useState(false);
+  const [mp4Loading, setMp4Loading] = useState(false);
+  const [mp4Error, setMp4Error] = useState<string | null>(null);
+
+  const [mcLoading, setMcLoading] = useState(false);
+  const [mcError, setMcError] = useState<string | null>(null);
+  const [mcStatus, setMcStatus] = useState("");
+  const [mcOffsetB, setMcOffsetB] = useState<number | null>(null);
+  const [mcOffsetC, setMcOffsetC] = useState<number | null>(null);
+  const [mcSegResults, setMcSegResults] = useState<SegmentResult[]>([]);
+  const [mcValidation, setMcValidation] = useState<string | null>(null);
+
+  const baseName = (filePath.split("/").pop() ?? "output").replace(/\.\w+$/, "");
+  const exportable = includeFiller ? segments : segments.filter((s) => !isFiller(s.title));
+
+  const hasB = !!bcamPath;
+  const hasC = !!ccamPath;
+  const multicamEnabled = hasB || hasC;
+
+  const handleExportMp4 = async () => {
+    setMp4Loading(true);
+    setMp4Error(null);
+    try {
+      const payload = exportable.map((s) => ({
+        title: s.title,
+        start: s.start,
+        end: s.end,
+      }));
+
+      const res = await fetch("/api/export-mp4", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filePath, segments: payload }),
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error((e as { error?: string }).error ?? res.statusText);
+      }
+      const blob = await res.blob();
+      const a = Object.assign(document.createElement("a"), {
+        href: URL.createObjectURL(blob),
+        download: `${baseName}_segments.zip`,
+      });
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      setMp4Error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMp4Loading(false);
+    }
+  };
+
+  const handleExportMulticam = async () => {
+    setMcLoading(true);
+    setMcError(null);
+    setMcStatus("Starting…");
+    setMcOffsetB(null);
+    setMcOffsetC(null);
+    setMcSegResults([]);
+    setMcValidation(null);
+
+    const payload = {
+      acamPath: filePath,
+      bcamPath: hasB ? bcamPath : undefined,
+      ccamPath: hasC ? ccamPath : undefined,
+      segments: exportable.map((s) => ({ title: s.title, start: s.start, end: s.end })),
+    };
+
+    try {
+      const res = await fetch("/api/multicam-export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.body) throw new Error("No response stream");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let downloadTriggered = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+          if (!raw) continue;
+          try {
+            const msg = JSON.parse(raw);
+            console.log("[multicam]", msg);
+            if (msg.error) { setMcError(msg.error); return; }
+            if (msg.stderr) continue;
+
+            switch (msg.status) {
+              case "probed_sources":
+                setMcStatus(`Probed sources (A=${msg.a_duration?.toFixed?.(1) ?? "?"}s, ${msg.a_fps} fps)`);
+                break;
+              case "estimating_offset_coarse":
+                setMcStatus(`Estimating ${msg.cam}-cam offset (coarse pass)…`);
+                break;
+              case "estimating_offset_fine":
+                setMcStatus(`Refining ${msg.cam}-cam offset…`);
+                break;
+              case "estimating_offset_fine_done":
+              case "estimating_offset_coarse_done":
+                break;
+              case "offsets_rounded":
+                if (typeof msg.b_offset === "number") setMcOffsetB(msg.b_offset);
+                if (typeof msg.c_offset === "number") setMcOffsetC(msg.c_offset);
+                setMcStatus("Offsets locked. Cutting segments…");
+                break;
+              case "segment_cut":
+                setMcSegResults((prev) => [
+                  ...prev,
+                  { index: msg.index, available: msg.available ?? [] },
+                ]);
+                setMcStatus(`Cut segment ${msg.index + 1} / ${exportable.length}`);
+                break;
+              case "segment_skipped":
+              case "segment_failed":
+                setMcSegResults((prev) => [
+                  ...prev,
+                  { index: msg.index, available: [], error: msg.reason ?? msg.error ?? "skipped" },
+                ]);
+                break;
+              case "validation_passed":
+                setMcValidation(
+                  `Sync OK (${msg.validation?.method ?? "?"}, tolerance ${msg.validation?.tolerance_seconds ?? "?"}s)`,
+                );
+                setMcStatus("Validating sync…");
+                break;
+              case "validation_failed":
+                setMcValidation(`Sync failed: ${JSON.stringify(msg.validation)}`);
+                break;
+              case "validation_skipped":
+                setMcValidation("Sync validation skipped");
+                break;
+              case "zipping":
+                setMcStatus("Zipping output…");
+                break;
+              case "zipped":
+                setMcStatus("Zip complete. Preparing download…");
+                break;
+              case "done":
+                setMcStatus("Pipeline finished.");
+                break;
+              case "ready":
+                if (msg.downloadId && !downloadTriggered) {
+                  downloadTriggered = true;
+                  setMcStatus("Downloading…");
+                  window.location.href = `/api/multicam-download/${msg.downloadId}`;
+                }
+                break;
+            }
+          } catch { /* ignore non-JSON */ }
+        }
+      }
+    } catch (e) {
+      setMcError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMcLoading(false);
+    }
+  };
+
+  const fillerCount = segments.filter((s) => isFiller(s.title)).length;
+
+  return (
+    <div className="max-w-2xl mx-auto">
+      <div className="mb-8">
+        <h2 className="text-2xl font-bold mb-1">Export</h2>
+        <p className="text-neutral-400 text-sm">
+          {exportable.length} clip{exportable.length !== 1 ? "s" : ""} ready to render as individual MP4s.
+        </p>
+        <p className="text-xs text-neutral-500 mt-1">
+          Each export includes ~5s padding before and after for safe trimming in your NLE.
+        </p>
+      </div>
+
+      <div className="mb-8 rounded-xl border border-neutral-800 bg-neutral-900/30 overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-neutral-800">
+          <span className="text-xs text-neutral-500 uppercase tracking-wider font-medium">Segments</span>
+          {fillerCount > 0 && (
+            <label className="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeFiller}
+                onChange={(e) => setIncludeFiller(e.target.checked)}
+                className="accent-cyan-500"
+              />
+              Include {fillerCount} filler clip{fillerCount !== 1 ? "s" : ""}
+            </label>
+          )}
+        </div>
+        <div className="divide-y divide-neutral-800">
+          {segments.map((seg, i) => {
+            const filler = isFiller(seg.title);
+            const willExport = includeFiller || !filler;
+            return (
+              <div
+                key={seg.id}
+                className={`flex items-center justify-between px-4 py-3 ${willExport ? "" : "opacity-40"}`}
+              >
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-neutral-600 font-mono w-5 text-right">{i + 1}</span>
+                  <span className={`text-sm ${filler ? "text-neutral-500 italic" : "text-neutral-200"}`}>
+                    {seg.title}
+                  </span>
+                </div>
+                <span className="text-xs text-neutral-500 font-mono">
+                  {fmtTime(seg.start)} → {fmtTime(seg.end)}
+                  <span className="text-neutral-700 ml-2">({Math.round(seg.end - seg.start)}s)</span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <button
+        onClick={handleExportMp4}
+        disabled={mp4Loading || !filePath || exportable.length === 0}
+        className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-emerald-500/50 bg-emerald-950/30 hover:bg-emerald-950/50 hover:border-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all group"
+      >
+        <div className="text-left">
+          <p className="text-sm font-semibold text-emerald-200">
+            {mp4Loading ? "Rendering MP4s…" : "Export MP4s (zip)"}
+          </p>
+          <p className="text-xs text-emerald-400/70 mt-0.5">
+            {exportable.length} MP4{exportable.length !== 1 ? "s" : ""} · stream-copied · ±5s padding for safety
+          </p>
+        </div>
+        <span className="text-emerald-400 group-hover:text-emerald-200 transition-colors text-lg">
+          {mp4Loading ? "⏳" : "⬇"}
+        </span>
+      </button>
+      {mp4Loading && (
+        <p className="text-xs text-neutral-500 mt-2 px-1">
+          Stream-copying segments — near-instant. Each clip includes ~5s pre/post-roll.
+        </p>
+      )}
+      {mp4Error && <p className="text-sm text-red-400 mt-3 px-1">{mp4Error}</p>}
+
+      <button
+        onClick={handleExportMulticam}
+        disabled={mcLoading || !filePath || exportable.length === 0 || !multicamEnabled}
+        title={!multicamEnabled ? "Select a B-cam or C-cam in Step 1 to enable multicam export." : undefined}
+        className="mt-4 w-full flex items-center justify-between px-5 py-4 rounded-xl border border-cyan-500/50 bg-cyan-950/30 hover:bg-cyan-950/50 hover:border-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all group"
+      >
+        <div className="text-left">
+          <p className="text-sm font-semibold text-cyan-200">
+            {mcLoading ? "Running multicam pipeline…" : "Export Multicam (zip)"}
+          </p>
+          <p className="text-xs text-cyan-400/70 mt-0.5">
+            {multicamEnabled
+              ? `A${hasB ? " + B" : ""}${hasC ? " + C" : ""} · audio sync · frame-accurate re-encode`
+              : "Add B-cam or C-cam in Step 1"}
+          </p>
+        </div>
+        <span className="text-cyan-400 group-hover:text-cyan-200 transition-colors text-lg">
+          {mcLoading ? "⏳" : "⬇"}
+        </span>
+      </button>
+
+      {(mcLoading || mcStatus || mcError || mcValidation || mcSegResults.length > 0) && (
+        <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-900/30 p-4 space-y-3">
+          {mcStatus && (
+            <div className="flex items-center gap-3">
+              <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${mcError ? "bg-red-500" : mcLoading ? "bg-cyan-500 animate-pulse" : "bg-green-500"}`} />
+              <span className="text-sm text-neutral-200 flex-1">{mcStatus}</span>
+            </div>
+          )}
+          {(mcOffsetB !== null || mcOffsetC !== null) && (
+            <div className="text-xs text-neutral-400 font-mono pl-5">
+              {mcOffsetB !== null && <span className="mr-4">B offset: {mcOffsetB.toFixed(3)}s</span>}
+              {mcOffsetC !== null && <span>C offset: {mcOffsetC.toFixed(3)}s</span>}
+            </div>
+          )}
+          {mcSegResults.length > 0 && (
+            <div className="text-xs space-y-1 pl-5 max-h-40 overflow-y-auto">
+              {mcSegResults.map((r) => (
+                <div key={r.index} className="flex items-center gap-2 font-mono">
+                  <span className="text-neutral-500 w-10">#{r.index + 1}</span>
+                  {r.error ? (
+                    <span className="text-amber-400">skipped — {r.error}</span>
+                  ) : (
+                    <span className="text-neutral-300">
+                      {r.available.map((c) => c.toUpperCase()).join(" + ") || "none"}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {mcValidation && (
+            <p className="text-xs text-cyan-400/80 pl-5">{mcValidation}</p>
+          )}
+          {mcError && (
+            <p className="text-sm text-red-400 mt-2 p-3 bg-red-950/20 border border-red-900/30 rounded-lg">
+              {mcError}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
