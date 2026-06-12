@@ -13,6 +13,8 @@ export default function Home() {
   const [filePath, setFilePath] = useState("");
   const [bcamPath, setBcamPath] = useState("");
   const [ccamPath, setCcamPath] = useState("");
+  const [lav1Path, setLav1Path] = useState("");
+  const [lav2Path, setLav2Path] = useState("");
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [segments, setSegments] = useState<SegmentGroup[]>([]);
 
@@ -22,12 +24,16 @@ export default function Home() {
     videoPath: string,
     bcam: string,
     ccam: string,
+    lav1: string,
+    lav2: string,
   ) => {
     setTranscript(t);
     setSegments(segs);
     setFilePath(videoPath);
     setBcamPath(bcam);
     setCcamPath(ccam);
+    setLav1Path(lav1);
+    setLav2Path(lav2);
     setStep("edit");
   };
 
@@ -95,6 +101,8 @@ export default function Home() {
             filePath={filePath}
             bcamPath={bcamPath}
             ccamPath={ccamPath}
+            lav1Path={lav1Path}
+            lav2Path={lav2Path}
           />
         )}
       </div>

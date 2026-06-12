@@ -8,6 +8,8 @@ interface Props {
   filePath: string;
   bcamPath: string;
   ccamPath: string;
+  lav1Path: string;
+  lav2Path: string;
 }
 
 function fmtTime(s: number): string {
@@ -26,58 +28,26 @@ interface SegmentResult {
   error?: string;
 }
 
-export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPath }: Props) {
+export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPath, lav1Path, lav2Path }: Props) {
   const [includeFiller, setIncludeFiller] = useState(false);
-  const [mp4Loading, setMp4Loading] = useState(false);
-  const [mp4Error, setMp4Error] = useState<string | null>(null);
 
   const [mcLoading, setMcLoading] = useState(false);
   const [mcError, setMcError] = useState<string | null>(null);
   const [mcStatus, setMcStatus] = useState("");
   const [mcOffsetB, setMcOffsetB] = useState<number | null>(null);
   const [mcOffsetC, setMcOffsetC] = useState<number | null>(null);
+  const [mcOffsetLav1, setMcOffsetLav1] = useState<number | null>(null);
+  const [mcOffsetLav2, setMcOffsetLav2] = useState<number | null>(null);
   const [mcSegResults, setMcSegResults] = useState<SegmentResult[]>([]);
   const [mcValidation, setMcValidation] = useState<string | null>(null);
 
-  const baseName = (filePath.split("/").pop() ?? "output").replace(/\.\w+$/, "");
   const exportable = includeFiller ? segments : segments.filter((s) => !isFiller(s.title));
 
   const hasB = !!bcamPath;
   const hasC = !!ccamPath;
-  const multicamEnabled = hasB || hasC;
-
-  const handleExportMp4 = async () => {
-    setMp4Loading(true);
-    setMp4Error(null);
-    try {
-      const payload = exportable.map((s) => ({
-        title: s.title,
-        start: s.start,
-        end: s.end,
-      }));
-
-      const res = await fetch("/api/export-mp4", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filePath, segments: payload }),
-      });
-      if (!res.ok) {
-        const e = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error((e as { error?: string }).error ?? res.statusText);
-      }
-      const blob = await res.blob();
-      const a = Object.assign(document.createElement("a"), {
-        href: URL.createObjectURL(blob),
-        download: `${baseName}_segments.zip`,
-      });
-      a.click();
-      URL.revokeObjectURL(a.href);
-    } catch (e) {
-      setMp4Error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setMp4Loading(false);
-    }
-  };
+  const hasLav1 = !!lav1Path;
+  const hasLav2 = !!lav2Path;
+  const multicamEnabled = hasB || hasC || hasLav1 || hasLav2;
 
   const handleExportMulticam = async () => {
     setMcLoading(true);
@@ -85,6 +55,8 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
     setMcStatus("Starting…");
     setMcOffsetB(null);
     setMcOffsetC(null);
+    setMcOffsetLav1(null);
+    setMcOffsetLav2(null);
     setMcSegResults([]);
     setMcValidation(null);
 
@@ -92,6 +64,8 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
       acamPath: filePath,
       bcamPath: hasB ? bcamPath : undefined,
       ccamPath: hasC ? ccamPath : undefined,
+      lav1Path: hasLav1 ? lav1Path : undefined,
+      lav2Path: hasLav2 ? lav2Path : undefined,
       segments: exportable.map((s) => ({ title: s.title, start: s.start, end: s.end })),
     };
 
@@ -141,6 +115,8 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
               case "offsets_rounded":
                 if (typeof msg.b_offset === "number") setMcOffsetB(msg.b_offset);
                 if (typeof msg.c_offset === "number") setMcOffsetC(msg.c_offset);
+                if (typeof msg.lav1_offset === "number") setMcOffsetLav1(msg.lav1_offset);
+                if (typeof msg.lav2_offset === "number") setMcOffsetLav2(msg.lav2_offset);
                 setMcStatus("Offsets locked. Cutting segments…");
                 break;
               case "segment_cut":
@@ -232,15 +208,15 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
             return (
               <div
                 key={seg.id}
-                className={`flex items-center justify-between px-4 py-3 ${willExport ? "" : "opacity-40"}`}
+                className={`flex items-center justify-between px-4 py-1.5 ${willExport ? "" : "opacity-40"}`}
               >
-                <div className="flex items-center gap-3">
-                  <span className="text-xs text-neutral-600 font-mono w-5 text-right">{i + 1}</span>
-                  <span className={`text-sm ${filler ? "text-neutral-500 italic" : "text-neutral-200"}`}>
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="text-xs text-neutral-600 font-mono w-5 text-right shrink-0">{i + 1}</span>
+                  <span className={`text-xs truncate ${filler ? "text-neutral-500 italic" : "text-neutral-200"}`}>
                     {seg.title}
                   </span>
                 </div>
-                <span className="text-xs text-neutral-500 font-mono">
+                <span className="text-xs text-neutral-500 font-mono shrink-0 ml-3">
                   {fmtTime(seg.start)} → {fmtTime(seg.end)}
                   <span className="text-neutral-700 ml-2">({Math.round(seg.end - seg.start)}s)</span>
                 </span>
@@ -251,34 +227,10 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
       </div>
 
       <button
-        onClick={handleExportMp4}
-        disabled={mp4Loading || !filePath || exportable.length === 0}
-        className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-emerald-500/50 bg-emerald-950/30 hover:bg-emerald-950/50 hover:border-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all group"
-      >
-        <div className="text-left">
-          <p className="text-sm font-semibold text-emerald-200">
-            {mp4Loading ? "Rendering MP4s…" : "Export MP4s (zip)"}
-          </p>
-          <p className="text-xs text-emerald-400/70 mt-0.5">
-            {exportable.length} MP4{exportable.length !== 1 ? "s" : ""} · stream-copied · ±5s padding for safety
-          </p>
-        </div>
-        <span className="text-emerald-400 group-hover:text-emerald-200 transition-colors text-lg">
-          {mp4Loading ? "⏳" : "⬇"}
-        </span>
-      </button>
-      {mp4Loading && (
-        <p className="text-xs text-neutral-500 mt-2 px-1">
-          Stream-copying segments — near-instant. Each clip includes ~5s pre/post-roll.
-        </p>
-      )}
-      {mp4Error && <p className="text-sm text-red-400 mt-3 px-1">{mp4Error}</p>}
-
-      <button
         onClick={handleExportMulticam}
         disabled={mcLoading || !filePath || exportable.length === 0 || !multicamEnabled}
-        title={!multicamEnabled ? "Select a B-cam or C-cam in Step 1 to enable multicam export." : undefined}
-        className="mt-4 w-full flex items-center justify-between px-5 py-4 rounded-xl border border-cyan-500/50 bg-cyan-950/30 hover:bg-cyan-950/50 hover:border-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all group"
+        title={!multicamEnabled ? "Select a B-cam, C-cam, or Lav in Step 1 to enable multicam export." : undefined}
+        className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-cyan-500/50 bg-cyan-950/30 hover:bg-cyan-950/50 hover:border-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all group"
       >
         <div className="text-left">
           <p className="text-sm font-semibold text-cyan-200">
@@ -286,8 +238,8 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
           </p>
           <p className="text-xs text-cyan-400/70 mt-0.5">
             {multicamEnabled
-              ? `A${hasB ? " + B" : ""}${hasC ? " + C" : ""} · audio sync · frame-accurate re-encode`
-              : "Add B-cam or C-cam in Step 1"}
+              ? `A${hasB ? " + B" : ""}${hasC ? " + C" : ""}${hasLav1 ? " + L1" : ""}${hasLav2 ? " + L2" : ""} · audio sync · frame-accurate re-encode`
+              : "Add B-cam, C-cam, or a Lav in Step 1"}
           </p>
         </div>
         <span className="text-cyan-400 group-hover:text-cyan-200 transition-colors text-lg">
@@ -303,10 +255,12 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
               <span className="text-sm text-neutral-200 flex-1">{mcStatus}</span>
             </div>
           )}
-          {(mcOffsetB !== null || mcOffsetC !== null) && (
-            <div className="text-xs text-neutral-400 font-mono pl-5">
-              {mcOffsetB !== null && <span className="mr-4">B offset: {mcOffsetB.toFixed(3)}s</span>}
+          {(mcOffsetB !== null || mcOffsetC !== null || mcOffsetLav1 !== null || mcOffsetLav2 !== null) && (
+            <div className="text-xs text-neutral-400 font-mono pl-5 flex flex-wrap gap-x-4 gap-y-1">
+              {mcOffsetB !== null && <span>B offset: {mcOffsetB.toFixed(3)}s</span>}
               {mcOffsetC !== null && <span>C offset: {mcOffsetC.toFixed(3)}s</span>}
+              {mcOffsetLav1 !== null && <span>L1 offset: {mcOffsetLav1.toFixed(3)}s</span>}
+              {mcOffsetLav2 !== null && <span>L2 offset: {mcOffsetLav2.toFixed(3)}s</span>}
             </div>
           )}
           {mcSegResults.length > 0 && (

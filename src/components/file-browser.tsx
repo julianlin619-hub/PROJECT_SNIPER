@@ -1,18 +1,9 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import { Textarea } from "@/components/ui/textarea";
 import { TranscriptEntry, SegmentGroup } from "@/lib/types";
-
-interface BrowseEntry {
-  name: string;
-  path: string;
-  type: "file" | "directory";
-  size?: number;
-}
 
 interface Props {
   onComplete: (
@@ -21,16 +12,12 @@ interface Props {
     videoPath: string,
     bcamPath: string,
     ccamPath: string,
+    lav1Path: string,
+    lav2Path: string,
   ) => void;
 }
 
-type SlotKey = "a" | "b" | "c";
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
+type SlotKey = "a" | "b" | "c" | "lav1" | "lav2";
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -38,12 +25,6 @@ function formatTime(seconds: number): string {
   const s = Math.floor(seconds % 60);
   if (h > 0) return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-const VIDEO_EXTENSIONS = [".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"];
-
-function isVideo(name: string): boolean {
-  return VIDEO_EXTENSIONS.some((ext) => name.toLowerCase().endsWith(ext));
 }
 
 type Phase = "browse" | "transcribing" | "segmenting";
@@ -66,12 +47,6 @@ const DEFAULT_SEGMENT_PROMPT =
   "(e.g. 'Sebastian – Netherlands relocation services').";
 
 export default function FileBrowser({ onComplete }: Props) {
-  const [dir, setDir] = useState("");
-  const [entries, setEntries] = useState<BrowseEntry[]>([]);
-  const [parent, setParent] = useState("");
-  const [browseLoading, setBrowseLoading] = useState(false);
-  const [browseError, setBrowseError] = useState<string | null>(null);
-
   const [videoPath, setVideoPath] = useState("");
   const [videoName, setVideoName] = useState("");
 
@@ -79,7 +54,13 @@ export default function FileBrowser({ onComplete }: Props) {
   const [bcamName, setBcamName] = useState("");
   const [ccamPath, setCcamPath] = useState("");
   const [ccamName, setCcamName] = useState("");
-  const [targetSlot, setTargetSlot] = useState<SlotKey>("a");
+  const [lav1Path, setLav1Path] = useState("");
+  const [lav1Name, setLav1Name] = useState("");
+  const [lav2Path, setLav2Path] = useState("");
+  const [lav2Name, setLav2Name] = useState("");
+
+  const [pickingSlot, setPickingSlot] = useState<SlotKey | null>(null);
+  const [pickError, setPickError] = useState<string | null>(null);
 
   const [phase, setPhase] = useState<Phase>("browse");
 
@@ -88,48 +69,41 @@ export default function FileBrowser({ onComplete }: Props) {
   const [txProgress, setTxProgress] = useState(0);
   const [txError, setTxError] = useState<string | null>(null);
 
-  // Segment prompt
-  const [promptMode, setPromptMode] = useState<"default" | "custom">("default");
-  const [customPrompt, setCustomPrompt] = useState("");
   const [segError, setSegError] = useState<string | null>(null);
 
-  const browse = async (targetDir?: string) => {
-    setBrowseLoading(true);
-    setBrowseError(null);
+  const SLOT_LABELS: Record<SlotKey, string> = {
+    a: "A-cam", b: "B-cam", c: "C-cam", lav1: "Lav 1", lav2: "Lav 2",
+  };
+
+  const pickFileFor = async (slot: SlotKey) => {
+    if (pickingSlot) return;
+    setPickingSlot(slot);
+    setPickError(null);
+    const isAudioSlot = slot === "lav1" || slot === "lav2";
     try {
-      const params = targetDir ? `?dir=${encodeURIComponent(targetDir)}` : "";
-      const res = await fetch(`/api/browse${params}`);
+      const res = await fetch("/api/pick-file", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: `Pick ${isAudioSlot ? "audio" : "video"} for ${SLOT_LABELS[slot]}`,
+          kind: isAudioSlot ? "audio" : "video",
+        }),
+      });
       const data = await res.json();
-      if (data.error) setBrowseError(data.error);
-      else {
-        setDir(data.dir);
-        setParent(data.parent);
-        setEntries(data.entries || []);
-      }
+      if (data.canceled) return;
+      if (data.error) { setPickError(data.error); return; }
+      if (slot === "a") { setVideoPath(data.path); setVideoName(data.name); }
+      else if (slot === "b") { setBcamPath(data.path); setBcamName(data.name); }
+      else if (slot === "c") { setCcamPath(data.path); setCcamName(data.name); }
+      else if (slot === "lav1") { setLav1Path(data.path); setLav1Name(data.name); }
+      else { setLav2Path(data.path); setLav2Name(data.name); }
     } catch (e: unknown) {
-      setBrowseError(e instanceof Error ? e.message : "Browse failed");
+      setPickError(e instanceof Error ? e.message : "Picker failed");
     } finally {
-      setBrowseLoading(false);
+      setPickingSlot(null);
     }
   };
 
-  useEffect(() => { browse(); }, []);
-
-  const handleFileClick = (entry: BrowseEntry) => {
-    if (!isVideo(entry.name)) return;
-    if (targetSlot === "a") { setVideoPath(entry.path); setVideoName(entry.name); }
-    else if (targetSlot === "b") { setBcamPath(entry.path); setBcamName(entry.name); }
-    else { setCcamPath(entry.path); setCcamName(entry.name); }
-  };
-
-  const slotOf = (path: string): SlotKey | null => {
-    if (path && path === videoPath) return "a";
-    if (path && path === bcamPath) return "b";
-    if (path && path === ccamPath) return "c";
-    return null;
-  };
-
-  const activePrompt = promptMode === "default" ? DEFAULT_SEGMENT_PROMPT : customPrompt;
   const videoSelected = !!videoPath;
 
   const runSegmentation = async (t: TranscriptEntry[]) => {
@@ -140,7 +114,7 @@ export default function FileBrowser({ onComplete }: Props) {
       const res = await fetch("/api/segment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: t, prompt: activePrompt }),
+        body: JSON.stringify({ transcript: t, prompt: DEFAULT_SEGMENT_PROMPT }),
       });
       const data = await res.json();
       if (data.error) setSegError(data.error);
@@ -148,7 +122,7 @@ export default function FileBrowser({ onComplete }: Props) {
     } catch (e: unknown) {
       setSegError(e instanceof Error ? e.message : "Segmentation failed");
     }
-    onComplete(t, segs, videoPath, bcamPath, ccamPath);
+    onComplete(t, segs, videoPath, bcamPath, ccamPath, lav1Path, lav2Path);
   };
 
   const startTranscription = async () => {
@@ -236,10 +210,6 @@ export default function FileBrowser({ onComplete }: Props) {
     }
   };
 
-  const videoFiles = entries.filter((e) => e.type === "file" && isVideo(e.name));
-  const dirs = entries.filter((e) => e.type === "directory" && !e.name.startsWith("."));
-  const hasRelevantFiles = videoFiles.length > 0 || dirs.length > 0;
-
   return (
     <div className="max-w-2xl mx-auto">
 
@@ -248,37 +218,55 @@ export default function FileBrowser({ onComplete }: Props) {
         <>
           <div className="mb-6">
             <h2 className="text-2xl font-bold mb-1">Select File</h2>
-            <p className="text-neutral-400 text-sm">Select the final MP4, then configure how to segment.</p>
+            <p className="text-neutral-400 text-sm">Click a slot below to browse your folders and pick a file. Files stay on your machine.</p>
           </div>
 
-          {/* Camera slots: A required, B/C optional. Click a slot to make it the
-              target, then click a file below to populate it. */}
-          <div className="mb-6 space-y-3">
+          {/* Camera slots: click a slot to open the native macOS file picker. */}
+          <div className="mb-6 space-y-2">
             {([
-              { key: "a" as SlotKey, label: "A-cam", subtitle: "Final MP4 (master — transcribed and segmented)", path: videoPath, name: videoName, clear: () => { setVideoPath(""); setVideoName(""); }, required: true },
-              { key: "b" as SlotKey, label: "B-cam", subtitle: "Alternate angle (optional, sync'd to A)", path: bcamPath, name: bcamName, clear: () => { setBcamPath(""); setBcamName(""); }, required: false },
-              { key: "c" as SlotKey, label: "C-cam", subtitle: "Alternate angle (optional, sync'd to A)", path: ccamPath, name: ccamName, clear: () => { setCcamPath(""); setCcamName(""); }, required: false },
+              { key: "a" as SlotKey, label: "A-cam", subtitle: "Final MP4 (master)", path: videoPath, name: videoName, clear: () => { setVideoPath(""); setVideoName(""); }, required: true },
+              { key: "b" as SlotKey, label: "B-cam", subtitle: "Alternate angle", path: bcamPath, name: bcamName, clear: () => { setBcamPath(""); setBcamName(""); }, required: false },
+              { key: "c" as SlotKey, label: "C-cam", subtitle: "Alternate angle", path: ccamPath, name: ccamName, clear: () => { setCcamPath(""); setCcamName(""); }, required: false },
+              { key: "lav1" as SlotKey, label: "Lav 1", subtitle: "Lavalier audio", path: lav1Path, name: lav1Name, clear: () => { setLav1Path(""); setLav1Name(""); }, required: false },
+              { key: "lav2" as SlotKey, label: "Lav 2", subtitle: "Lavalier audio", path: lav2Path, name: lav2Name, clear: () => { setLav2Path(""); setLav2Name(""); }, required: false },
             ]).map((slot) => {
-              const isTarget = targetSlot === slot.key;
               const hasFile = !!slot.path;
+              const isPicking = pickingSlot === slot.key;
               const borderClass = hasFile
                 ? "border-cyan-500 bg-cyan-950/20"
-                : isTarget
+                : isPicking
                 ? "border-amber-500/70 bg-amber-950/10"
-                : "border-dashed border-neutral-700 bg-neutral-900/30";
+                : "border-dashed border-neutral-700 bg-neutral-900/30 hover:border-neutral-600 hover:bg-neutral-900/60";
               return (
                 <button
                   key={slot.key}
-                  onClick={() => setTargetSlot(slot.key)}
-                  className={`w-full text-left rounded-xl border-2 p-4 transition-colors ${borderClass}`}
+                  onClick={() => pickFileFor(slot.key)}
+                  disabled={!!pickingSlot && !isPicking}
+                  className={`w-full text-left rounded-lg border-2 px-3 py-2 transition-colors disabled:opacity-50 ${borderClass}`}
                 >
-                  <div className="flex items-start justify-between mb-2">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
-                      {slot.label}{slot.required ? "" : " (optional)"}
+                  <div className="flex items-center gap-3">
+                    <span className="text-base shrink-0">
+                      {hasFile ? (slot.key.startsWith("lav") ? "🎙️" : "🎬") : "📂"}
                     </span>
-                    <div className="flex items-center gap-2">
-                      {isTarget && !hasFile && (
-                        <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-400">Target — pick a file below</span>
+                    <div className="flex flex-col min-w-0 flex-1">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-neutral-400 shrink-0">
+                          {slot.label}{slot.required ? "" : " (opt)"}
+                        </span>
+                        <span className="text-[11px] text-neutral-500 truncate">{slot.subtitle}</span>
+                      </div>
+                      {hasFile ? (
+                        <span className="text-xs text-cyan-300 font-mono truncate">{slot.name}</span>
+                      ) : (
+                        <span className="text-[11px] text-neutral-600">No file selected</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {!hasFile && !isPicking && (
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Click to browse</span>
+                      )}
+                      {isPicking && (
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-400">Picker open…</span>
                       )}
                       {hasFile && (
                         <span
@@ -286,7 +274,7 @@ export default function FileBrowser({ onComplete }: Props) {
                           tabIndex={0}
                           onClick={(e) => { e.stopPropagation(); slot.clear(); }}
                           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); slot.clear(); } }}
-                          className="text-neutral-500 hover:text-neutral-300 text-xs cursor-pointer"
+                          className="text-neutral-500 hover:text-neutral-300 text-xs cursor-pointer px-1"
                           aria-label={`Clear ${slot.label}`}
                         >
                           ✕
@@ -294,53 +282,22 @@ export default function FileBrowser({ onComplete }: Props) {
                       )}
                     </div>
                   </div>
-                  <p className="text-xs text-neutral-500 mb-3">{slot.subtitle}</p>
-                  {hasFile ? (
-                    <div className="flex items-center gap-2"><span className="text-lg">🎬</span><span className="text-xs text-cyan-300 font-mono truncate">{slot.name}</span></div>
-                  ) : (
-                    <div className="flex items-center gap-2 text-neutral-600"><span className="text-lg">🎬</span><span className="text-xs">No file selected</span></div>
-                  )}
                 </button>
               );
             })}
           </div>
 
-          {/* Segment prompt — appears when video selected */}
+          {pickError && (
+            <div className="mb-4 text-red-400 text-sm p-3 bg-red-950/20 border border-red-900/30 rounded-lg">
+              {pickError}
+            </div>
+          )}
+
           {videoSelected && (
-            <div className="mb-6 rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
-              <p className="text-sm font-semibold text-white mb-3">Segmentation Prompt</p>
-              <div className="flex gap-2 mb-4">
-                <button
-                  onClick={() => setPromptMode("default")}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${promptMode === "default" ? "bg-cyan-600 text-white" : "bg-neutral-800 text-neutral-400 hover:text-white"}`}
-                >
-                  Default
-                </button>
-                <button
-                  onClick={() => setPromptMode("custom")}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${promptMode === "custom" ? "bg-cyan-600 text-white" : "bg-neutral-800 text-neutral-400 hover:text-white"}`}
-                >
-                  Custom
-                </button>
-              </div>
-
-              {promptMode === "default" ? (
-                <div className="bg-neutral-950 border border-neutral-700 rounded-lg p-3 mb-4 max-h-[120px] overflow-y-auto">
-                  <p className="text-xs text-neutral-400 leading-relaxed">{DEFAULT_SEGMENT_PROMPT}</p>
-                </div>
-              ) : (
-                <Textarea
-                  value={customPrompt}
-                  onChange={(e) => setCustomPrompt(e.target.value)}
-                  placeholder="Describe how to segment this video — e.g. split by topic, by speaker, by caller..."
-                  className="min-h-[100px] bg-neutral-950 border-neutral-700 text-white placeholder:text-neutral-600 mb-4 text-sm"
-                />
-              )}
-
+            <div className="mb-6">
               <Button
                 onClick={startTranscription}
-                disabled={promptMode === "custom" && !customPrompt.trim()}
-                className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-semibold disabled:opacity-40"
+                className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-semibold"
               >
                 Transcribe + Segment →
               </Button>
@@ -350,50 +307,10 @@ export default function FileBrowser({ onComplete }: Props) {
           {!videoSelected && (
             <div className="mb-6">
               <div className="w-full rounded-xl border border-dashed border-neutral-700 px-5 py-3 text-center text-sm text-neutral-600">
-                Select a file above to continue
+                Pick an MP4 in the A-cam slot to continue
               </div>
             </div>
           )}
-
-          {/* File browser */}
-          <div className="border border-neutral-800 rounded-xl overflow-hidden">
-            <div className="flex items-center gap-2 px-4 py-2.5 bg-neutral-900/60 border-b border-neutral-800">
-              <span className="text-xs text-neutral-500 font-mono truncate flex-1">{dir || "Loading..."}</span>
-              {parent && parent !== dir && (
-                <button onClick={() => browse(parent)} disabled={browseLoading} className="text-xs text-neutral-400 hover:text-white shrink-0">↑ Up</button>
-              )}
-            </div>
-            {browseError && <div className="text-red-400 text-xs p-4 bg-red-950/20">{browseError}</div>}
-            {browseLoading && <div className="text-neutral-500 text-sm py-10 text-center">Loading...</div>}
-            {!browseLoading && (
-              <div className="divide-y divide-neutral-800/50">
-                {dirs.map((entry) => (
-                  <button key={entry.path} onClick={() => browse(entry.path)} className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-neutral-800/40 transition-colors text-left">
-                    <span className="text-base">📁</span>
-                    <span className="flex-1 text-sm text-neutral-300 truncate">{entry.name}</span>
-                    <span className="text-neutral-600 text-xs">›</span>
-                  </button>
-                ))}
-                {videoFiles.map((entry) => {
-                  const inSlot = slotOf(entry.path);
-                  return (
-                    <button key={entry.path} onClick={() => handleFileClick(entry)}
-                      className={`w-full flex items-center gap-3 px-4 py-2.5 transition-all text-left ${inSlot ? "bg-cyan-950/30 hover:bg-cyan-950/50" : "hover:bg-neutral-800/40"}`}>
-                      <span className="text-base">🎬</span>
-                      <span className="flex-1 text-sm text-white truncate">{entry.name}</span>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {inSlot
-                          ? <span className="text-xs text-cyan-400">{inSlot.toUpperCase()}-cam ✓</span>
-                          : <Badge variant="outline" className="text-xs border-cyan-800/50 text-cyan-500 bg-cyan-950/20">MP4</Badge>}
-                        {entry.size && <span className="text-xs text-neutral-500">{formatSize(entry.size)}</span>}
-                      </div>
-                    </button>
-                  );
-                })}
-                {!hasRelevantFiles && <div className="text-neutral-600 text-sm py-10 text-center">No relevant files here</div>}
-              </div>
-            )}
-          </div>
         </>
       )}
 
@@ -440,6 +357,7 @@ export default function FileBrowser({ onComplete }: Props) {
           )}
         </>
       )}
+
     </div>
   );
 }

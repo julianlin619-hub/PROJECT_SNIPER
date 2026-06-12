@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Multicam sync + cut pipeline.
 
-Takes 3 camera files (A=master, B/C alternates that may have started rolling later),
-computes B/C audio-sync offsets against A, cuts frame-accurate clips per camera at
-A-cam-defined segment timecodes, and self-validates the result.
+Takes A-cam (master, required) plus any combination of B-cam, C-cam, and up to
+two audio-only lavalier inputs (lav1, lav2) that may have started rolling later.
+Computes per-alt audio-sync offsets against A, cuts frame-accurate clips per
+camera (and sample-accurate PCM WAV clips per lav) at A-cam-defined segment
+timecodes, and self-validates the result.
 
   python3 scripts/multicam_pipeline.py \\
     --acam Acam_full.mp4 --bcam Bcam_full.mp4 --ccam Ccam_full.mp4 \\
+    --lav1 lav1.wav --lav2 lav2.wav \\
     --segments segments.json --outdir ./out/multicam
 
 segments.json: [{"start": float, "end": float, "title"?: str}, ...] in A-cam timecode.
 
-Sign convention: positive offset = camera started LATER than A.
+Sign convention: positive offset = source started LATER than A.
     alt_time_in_alt_file = a_time - alt_offset
 """
 
@@ -274,6 +277,32 @@ def cut_segment(src, start, dur, out, audio_copy):
     run_command(cmd)
 
 
+def cut_audio_segment(src, start, dur, out):
+    """Sample-accurate PCM WAV clip from an audio-only source.
+
+    Always decodes to pcm_s16le so the output is uniform regardless of input
+    container (.wav/.mp3/.m4a/.aac/.flac/.ogg/.opus). Source channel count is
+    preserved (no -ac flag — don't downmix). Same dual-seek pattern as
+    cut_segment / extract_audio_window for sample-precise trim boundaries.
+    """
+    start = max(0.0, start)
+    pre_seek = max(0.0, start - 5.0)
+    fine_seek = start - pre_seek
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    if pre_seek > 0:
+        cmd += ["-ss", f"{pre_seek:.3f}"]
+    cmd += ["-i", src]
+    if fine_seek > 0:
+        cmd += ["-ss", f"{fine_seek:.3f}"]
+    cmd += [
+        "-t", f"{dur:.3f}",
+        "-vn",
+        "-c:a", "pcm_s16le", "-f", "wav",
+        out,
+    ]
+    run_command(cmd)
+
+
 # ---------- validation ----------
 
 def measure_clip_lag(ref_clip, alt_clip, tmp_dir, probe_dur=10.0):
@@ -344,9 +373,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="Multicam sync + cut pipeline.")
     p.add_argument("--acam", required=True)
     p.add_argument("--bcam", default=None,
-                   help="Optional. At least one of --bcam/--ccam must be provided.")
+                   help="Optional. At least one of --bcam/--ccam/--lav1/--lav2 must be provided.")
     p.add_argument("--ccam", default=None,
-                   help="Optional. At least one of --bcam/--ccam must be provided.")
+                   help="Optional. At least one of --bcam/--ccam/--lav1/--lav2 must be provided.")
+    p.add_argument("--lav1", default=None,
+                   help="Optional audio-only source (lavalier mic). Sync'd to A-cam audio.")
+    p.add_argument("--lav2", default=None,
+                   help="Optional audio-only source (lavalier mic). Sync'd to A-cam audio.")
     p.add_argument("--segments", required=True,
                    help="JSON file: [{start, end, title?}, ...] in A-cam timecode")
     p.add_argument("--outdir", required=True)
@@ -355,7 +388,7 @@ def parse_args():
     p.add_argument("--coarse-sr", type=int, default=8000)
     p.add_argument("--fine-sr", type=int, default=16000)
     p.add_argument("--max-offset", type=float, default=1200.0,
-                   help="Max plausible offset (s) of B/C after A.")
+                   help="Max plausible offset (s) of any alt source after A.")
     p.add_argument("--tolerance-frames", type=float, default=1.5,
                    help="Allowed sync drift (A-cam frames). Re-encode can shift PTS ~10-40ms; 1.5 is safer than 1.")
     p.add_argument("--skip-validation", action="store_true")
@@ -367,8 +400,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if not args.bcam and not args.ccam:
-        print(json.dumps({"error": "At least one of --bcam or --ccam is required"}),
+    if not any([args.bcam, args.ccam, args.lav1, args.lav2]):
+        print(json.dumps({"error": "At least one of --bcam / --ccam / --lav1 / --lav2 is required"}),
               file=sys.stderr, flush=True)
         sys.exit(1)
 
@@ -377,6 +410,10 @@ def main():
         paths_to_check.append(args.bcam)
     if args.ccam:
         paths_to_check.append(args.ccam)
+    if args.lav1:
+        paths_to_check.append(args.lav1)
+    if args.lav2:
+        paths_to_check.append(args.lav2)
     for p in paths_to_check:
         if not os.path.exists(p):
             print(json.dumps({"error": f"Not found: {p}"}), file=sys.stderr, flush=True)
@@ -390,14 +427,21 @@ def main():
         (outdir / "bcam_clips").mkdir(parents=True, exist_ok=True)
     if args.ccam:
         (outdir / "ccam_clips").mkdir(parents=True, exist_ok=True)
+    if args.lav1:
+        (outdir / "lav1_clips").mkdir(parents=True, exist_ok=True)
+    if args.lav2:
+        (outdir / "lav2_clips").mkdir(parents=True, exist_ok=True)
     manifest_path = outdir / "clips_manifest.json"
 
     a_dur = ffprobe_duration(args.acam)
     b_dur = ffprobe_duration(args.bcam) if args.bcam else None
     c_dur = ffprobe_duration(args.ccam) if args.ccam else None
+    l1_dur = ffprobe_duration(args.lav1) if args.lav1 else None
+    l2_dur = ffprobe_duration(args.lav2) if args.lav2 else None
     fps = ffprobe_frame_rate(args.acam)
     log_status(status="probed_sources", a_duration=a_dur, b_duration=b_dur,
-               c_duration=c_dur, a_fps=str(fps))
+               c_duration=c_dur, lav1_duration=l1_dur, lav2_duration=l2_dur,
+               a_fps=str(fps))
 
     alt_cams = []
     if args.bcam:
@@ -429,6 +473,8 @@ def main():
 
     b_offset = None
     c_offset = None
+    l1_offset = None
+    l2_offset = None
     with tempfile.TemporaryDirectory(prefix="multicam-xcorr-") as tmp:
         if args.bcam:
             b_raw = estimate_offset("B", args.acam, args.bcam, a_dur, b_dur,
@@ -440,9 +486,21 @@ def main():
                                     args.coarse_sr, args.fine_sr,
                                     args.probe_dur, args.max_offset, tmp)
             c_offset = round_offset_to_frame(c_raw, fps)
+        if args.lav1:
+            l1_raw = estimate_offset("L1", args.acam, args.lav1, a_dur, l1_dur,
+                                     args.coarse_sr, args.fine_sr,
+                                     args.probe_dur, args.max_offset, tmp)
+            l1_offset = round_offset_to_frame(l1_raw, fps)
+        if args.lav2:
+            l2_raw = estimate_offset("L2", args.acam, args.lav2, a_dur, l2_dur,
+                                     args.coarse_sr, args.fine_sr,
+                                     args.probe_dur, args.max_offset, tmp)
+            l2_offset = round_offset_to_frame(l2_raw, fps)
     log_status(status="offsets_rounded",
                b_offset=round(b_offset, 4) if b_offset is not None else None,
-               c_offset=round(c_offset, 4) if c_offset is not None else None)
+               c_offset=round(c_offset, 4) if c_offset is not None else None,
+               lav1_offset=round(l1_offset, 4) if l1_offset is not None else None,
+               lav2_offset=round(l2_offset, 4) if l2_offset is not None else None)
 
     raw_segments = json.loads(Path(args.segments).read_text())
     if not isinstance(raw_segments, list) or not raw_segments:
@@ -462,6 +520,12 @@ def main():
             "ccam": (None if not args.ccam else
                      {"path": str(Path(args.ccam).resolve()),
                       "duration": c_dur, "offset_seconds": c_offset}),
+            "lav1": (None if not args.lav1 else
+                     {"path": str(Path(args.lav1).resolve()),
+                      "duration": l1_dur, "offset_seconds": l1_offset}),
+            "lav2": (None if not args.lav2 else
+                     {"path": str(Path(args.lav2).resolve()),
+                      "duration": l2_dur, "offset_seconds": l2_offset}),
         },
         "convention": "alt_time = a_time - alt_offset (positive offset = alt started later)",
         "segments": [],
@@ -477,7 +541,9 @@ def main():
             "index": i, "title": title,
             "a_start": seg.get("start"), "a_end": seg.get("end"),
             "acam_clip": None, "bcam_clip": None, "ccam_clip": None,
+            "lav1_clip": None, "lav2_clip": None,
             "bcam_available": False, "ccam_available": False,
+            "lav1_available": False, "lav2_available": False,
             "error": None,
         }
 
@@ -517,6 +583,28 @@ def main():
                     entry["ccam_clip"] = str(c_out.relative_to(outdir))
                     entry["ccam_available"] = True
                     avail.append("c")
+
+            wav_base = f"segment_{i:0{pad}d}.wav"
+
+            if args.lav1:
+                l1_start = a_start - l1_offset
+                l1_end = a_end - l1_offset
+                if l1_start >= 0.0 and l1_end <= l1_dur:
+                    l1_out = outdir / "lav1_clips" / wav_base
+                    cut_audio_segment(args.lav1, l1_start, dur, str(l1_out))
+                    entry["lav1_clip"] = str(l1_out.relative_to(outdir))
+                    entry["lav1_available"] = True
+                    avail.append("l1")
+
+            if args.lav2:
+                l2_start = a_start - l2_offset
+                l2_end = a_end - l2_offset
+                if l2_start >= 0.0 and l2_end <= l2_dur:
+                    l2_out = outdir / "lav2_clips" / wav_base
+                    cut_audio_segment(args.lav2, l2_start, dur, str(l2_out))
+                    entry["lav2_clip"] = str(l2_out.relative_to(outdir))
+                    entry["lav2_available"] = True
+                    avail.append("l2")
 
             log_status(status="segment_cut", index=i, available=avail)
         except Exception as exc:
@@ -558,7 +646,13 @@ def main():
                                   if s["acam_clip"] and s["bcam_clip"]), None) if has_b else None
                     c_seg = next((s for s in manifest["segments"]
                                   if s["acam_clip"] and s["ccam_clip"]), None) if has_c else None
-                    if not b_seg and not c_seg:
+                    has_l1 = args.lav1 is not None
+                    has_l2 = args.lav2 is not None
+                    l1_seg = next((s for s in manifest["segments"]
+                                   if s["acam_clip"] and s["lav1_clip"]), None) if has_l1 else None
+                    l2_seg = next((s for s in manifest["segments"]
+                                   if s["acam_clip"] and s["lav2_clip"]), None) if has_l2 else None
+                    if not b_seg and not c_seg and not l1_seg and not l2_seg:
                         validation.update(method="skipped_no_overlap", passed=True)
                     else:
                         validation.update(method="per_cam", passed=True)
@@ -575,6 +669,20 @@ def main():
                             validation["c_segment_index"] = c_seg["index"]
                             validation["c_lag_seconds"] = round(c_lag, 4)
                             if abs(c_lag) > tolerance_s:
+                                validation["passed"] = False
+                        if l1_seg:
+                            l1_lag = measure_clip_lag(str(outdir / l1_seg["acam_clip"]),
+                                                      str(outdir / l1_seg["lav1_clip"]), tmp)
+                            validation["lav1_segment_index"] = l1_seg["index"]
+                            validation["lav1_lag_seconds"] = round(l1_lag, 4)
+                            if abs(l1_lag) > tolerance_s:
+                                validation["passed"] = False
+                        if l2_seg:
+                            l2_lag = measure_clip_lag(str(outdir / l2_seg["acam_clip"]),
+                                                      str(outdir / l2_seg["lav2_clip"]), tmp)
+                            validation["lav2_segment_index"] = l2_seg["index"]
+                            validation["lav2_lag_seconds"] = round(l2_lag, 4)
+                            if abs(l2_lag) > tolerance_s:
                                 validation["passed"] = False
         except Exception as exc:
             validation["error"] = f"{type(exc).__name__}: {exc}"

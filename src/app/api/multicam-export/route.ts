@@ -23,6 +23,8 @@ interface Body {
   acamPath?: unknown;
   bcamPath?: unknown;
   ccamPath?: unknown;
+  lav1Path?: unknown;
+  lav2Path?: unknown;
   segments?: unknown;
 }
 
@@ -42,7 +44,7 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  const { acamPath, bcamPath, ccamPath, segments } = body;
+  const { acamPath, bcamPath, ccamPath, lav1Path, lav2Path, segments } = body;
 
   if (typeof acamPath !== "string" || !existsSync(acamPath)) {
     return new Response(JSON.stringify({ error: `A-cam not found: ${String(acamPath)}` }), {
@@ -52,8 +54,12 @@ export async function POST(req: NextRequest) {
   }
   const hasB = typeof bcamPath === "string" && bcamPath.length > 0;
   const hasC = typeof ccamPath === "string" && ccamPath.length > 0;
-  if (!hasB && !hasC) {
-    return new Response(JSON.stringify({ error: "Provide at least one of bcamPath / ccamPath" }), {
+  const hasLav1 = typeof lav1Path === "string" && lav1Path.length > 0;
+  const hasLav2 = typeof lav2Path === "string" && lav2Path.length > 0;
+  if (!hasB && !hasC && !hasLav1 && !hasLav2) {
+    return new Response(JSON.stringify({
+      error: "Provide at least one of bcamPath / ccamPath / lav1Path / lav2Path",
+    }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
@@ -66,6 +72,18 @@ export async function POST(req: NextRequest) {
   }
   if (hasC && !existsSync(ccamPath as string)) {
     return new Response(JSON.stringify({ error: `C-cam not found: ${ccamPath}` }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (hasLav1 && !existsSync(lav1Path as string)) {
+    return new Response(JSON.stringify({ error: `Lav 1 not found: ${lav1Path}` }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (hasLav2 && !existsSync(lav2Path as string)) {
+    return new Response(JSON.stringify({ error: `Lav 2 not found: ${lav2Path}` }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
@@ -101,6 +119,8 @@ export async function POST(req: NextRequest) {
   ];
   if (hasB) args.push("--bcam", bcamPath as string);
   if (hasC) args.push("--ccam", ccamPath as string);
+  if (hasLav1) args.push("--lav1", lav1Path as string);
+  if (hasLav2) args.push("--lav2", lav2Path as string);
 
   const cleanup = () => {
     try { rmSync(workDir, { recursive: true, force: true }); } catch {}
