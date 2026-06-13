@@ -52,3 +52,7 @@ scripts/__pycache__/
 
 # Claude Code per-user settings (project allowlist .claude/settings.json IS committed)
 .claude/settings.local.json
+
+# scratch artifacts (Playwright MCP output, design mockup screenshots)
+.playwright-mcp/
+file-browser-redesigned*.png

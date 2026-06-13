@@ -4,8 +4,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
-import { pythonInterpreter, SCRIPTS_DIR } from "../_lib/spawn-python";
-import { register } from "../_lib/multicam-store";
+import { pythonInterpreter, SCRIPTS_DIR } from "../../_lib/spawn-python";
+import { register } from "../../_lib/multicam-store";
 
 export const runtime = "nodejs";
 export const maxDuration = 3600;

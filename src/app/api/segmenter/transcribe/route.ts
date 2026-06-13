@@ -2,12 +2,12 @@ import { NextRequest } from "next/server";
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import path from "path";
-import { pythonInterpreter } from "../_lib/spawn-python";
+import { pythonInterpreter, SCRIPTS_DIR } from "../../_lib/spawn-python";
 
 export const maxDuration = 600;
 export const dynamic = "force-dynamic";
 
-const SCRIPT_PATH = path.join(process.cwd(), "scripts", "transcribe.py");
+const SCRIPT_PATH = path.join(SCRIPTS_DIR, "transcribe.py");
 
 export async function POST(req: NextRequest) {
   const { filePath } = await req.json();

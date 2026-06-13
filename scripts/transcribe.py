@@ -248,7 +248,8 @@ async def main() -> None:
             audio_offset = audio_start
 
             print(json.dumps({"status": "extracting_audio"}), flush=True)
-            tmp = tempfile.mktemp(suffix=".mp3", prefix="clipper-audio-")
+            fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="clipper-audio-")
+            os.close(fd)
             ffmpeg_cmd = ["ffmpeg", "-i", audio_path]
             if is_video:
                 ffmpeg_cmd.append("-vn")

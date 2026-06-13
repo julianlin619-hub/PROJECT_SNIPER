@@ -1,0 +1,6 @@
+# SEGMENTER transcribe (scripts/transcribe.py)
+deepgram-sdk>=6.0.0
+# SEGMENTER multicam (scripts/multicam_pipeline.py)
+scipy
+# CLIPPER transcribe stereo-channel isolation (scripts/clipper_transcribe.py) + multicam
+numpy>=1.26

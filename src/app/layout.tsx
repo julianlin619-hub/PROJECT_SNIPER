@@ -9,9 +9,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SEGMENTER — AI Video Segmentation",
+  title: "PROJECT SNIPER — AI Video Pipeline",
   description:
-    "Transcribe, segment, and export video clips with AI. Powered by Deepgram + Claude.",
+    "SEGMENTER rough-cuts long footage into clips; CLIPPER refines clips into polished cuts. Powered by Deepgram + Claude.",
 };
 
 export default function RootLayout({

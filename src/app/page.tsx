@@ -1,110 +1,64 @@
-"use client";
+import Link from "next/link";
 
-import { useState } from "react";
-import { TranscriptEntry, SegmentGroup } from "@/lib/types";
-import FileBrowser from "@/components/file-browser";
-import TranscriptSegmentEditor from "@/components/transcript-segment-editor";
-import SegmentExportStep from "@/components/segment-export-step";
-
-type AppStep = "browse" | "edit" | "export";
+const TOOLS = [
+  {
+    href: "/segmenter",
+    emoji: "🎬",
+    name: "SEGMENTER",
+    part: "Part 1",
+    blurb:
+      "Feed in long footage. Deepgram transcribes, Claude picks segment boundaries, and ffmpeg stream-copies rough clips (single or multicam) as a zip for NLE trimming.",
+    accent: "hover:border-violet-600/60",
+  },
+  {
+    href: "/clipper",
+    emoji: "✂️",
+    name: "CLIPPER",
+    part: "Part 2",
+    blurb:
+      "Take a clip and refine it. Transcribe, let the LLM cut filler at the word level, fine-tune in the editor, and export a polished FCPXML timeline for Final Cut Pro.",
+    accent: "hover:border-violet-600/60",
+  },
+] as const;
 
 export default function Home() {
-  const [step, setStep] = useState<AppStep>("browse");
-  const [filePath, setFilePath] = useState("");
-  const [bcamPath, setBcamPath] = useState("");
-  const [ccamPath, setCcamPath] = useState("");
-  const [lav1Path, setLav1Path] = useState("");
-  const [lav2Path, setLav2Path] = useState("");
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [segments, setSegments] = useState<SegmentGroup[]>([]);
-
-  const handleTranscribeComplete = (
-    t: TranscriptEntry[],
-    segs: SegmentGroup[],
-    videoPath: string,
-    bcam: string,
-    ccam: string,
-    lav1: string,
-    lav2: string,
-  ) => {
-    setTranscript(t);
-    setSegments(segs);
-    setFilePath(videoPath);
-    setBcamPath(bcam);
-    setCcamPath(ccam);
-    setLav1Path(lav1);
-    setLav2Path(lav2);
-    setStep("edit");
-  };
-
-  const stepLabels: { key: AppStep; label: string }[] = [
-    { key: "browse", label: "1. Transcribe" },
-    { key: "edit", label: "2. Edit Segments" },
-    { key: "export", label: "3. Export" },
-  ];
-
-  const stepOrder: AppStep[] = ["browse", "edit", "export"];
-  const currentIdx = stepOrder.indexOf(step);
-
   return (
-    <main className="min-h-screen bg-neutral-950 text-white">
-      {/* Top bar */}
-      <div className="border-b border-neutral-800 px-6 py-4">
-        <div className="max-w-5xl mx-auto flex items-center gap-4">
-          <span className="text-lg font-bold tracking-tight">🎬 SEGMENTER</span>
-          <div className="flex items-center gap-1.5 ml-4">
-            {stepLabels.map((s, i) => (
-              <div key={s.key} className="flex items-center gap-1.5">
-                <button
-                  onClick={() => {
-                    const targetIdx = stepOrder.indexOf(s.key);
-                    if (targetIdx <= currentIdx) setStep(s.key);
-                  }}
-                  disabled={stepOrder.indexOf(s.key) > currentIdx}
-                  className={`text-xs px-3 py-1.5 rounded-full transition-colors ${
-                    step === s.key
-                      ? "bg-cyan-600 text-white font-medium"
-                      : stepOrder.indexOf(s.key) < currentIdx
-                      ? "text-neutral-400 hover:text-neutral-200 cursor-pointer"
-                      : "text-neutral-700 cursor-not-allowed"
-                  }`}
-                >
-                  {s.label}
-                </button>
-                {i < stepLabels.length - 1 && (
-                  <span className="text-neutral-800">→</span>
-                )}
-              </div>
-            ))}
-          </div>
+    <main className="min-h-screen bg-neutral-950 text-white flex flex-col items-center justify-center px-6 py-16">
+      <div className="max-w-3xl w-full">
+        <div className="text-center mb-12">
+          <h1 className="text-3xl font-bold tracking-tight">
+            🎯 PROJECT SNIPER
+          </h1>
+          <p className="mt-2 text-neutral-400 text-sm">
+            AI video pipeline — rough-cut with SEGMENTER, then polish with CLIPPER.
+          </p>
         </div>
-      </div>
 
-      {/* Content */}
-      <div className="max-w-5xl mx-auto px-6 py-8">
-        {step === "browse" && (
-          <FileBrowser onComplete={handleTranscribeComplete} />
-        )}
-
-        {step === "edit" && (
-          <TranscriptSegmentEditor
-            transcript={transcript}
-            segments={segments}
-            onChange={setSegments}
-            onContinue={() => setStep("export")}
-          />
-        )}
-
-        {step === "export" && (
-          <SegmentExportStep
-            segments={segments}
-            filePath={filePath}
-            bcamPath={bcamPath}
-            ccamPath={ccamPath}
-            lav1Path={lav1Path}
-            lav2Path={lav2Path}
-          />
-        )}
+        <div className="grid gap-5 sm:grid-cols-2">
+          {TOOLS.map((t) => (
+            <Link
+              key={t.href}
+              href={t.href}
+              className={`group rounded-xl border border-neutral-800 bg-neutral-900/40 p-6 transition-colors ${t.accent}`}
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-2xl">{t.emoji}</span>
+                <span className="text-lg font-semibold tracking-tight">
+                  {t.name}
+                </span>
+                <span className="ml-auto text-[11px] font-medium uppercase tracking-wide text-violet-400">
+                  {t.part}
+                </span>
+              </div>
+              <p className="mt-3 text-sm leading-relaxed text-neutral-400">
+                {t.blurb}
+              </p>
+              <span className="mt-4 inline-block text-sm font-medium text-neutral-300 group-hover:text-white transition-colors">
+                Open {t.name} →
+              </span>
+            </Link>
+          ))}
+        </div>
       </div>
     </main>
   );

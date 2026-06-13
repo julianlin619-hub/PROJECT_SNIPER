@@ -4,7 +4,7 @@ import { Readable } from "stream";
 import path from "path";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
-import { spawnPython, SCRIPTS_DIR } from "../_lib/spawn-python";
+import { spawnPython, SCRIPTS_DIR } from "../../_lib/spawn-python";
 
 export const runtime = "nodejs";
 export const maxDuration = 600;

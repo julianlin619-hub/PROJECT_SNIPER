@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createReadStream, existsSync, statSync, unlinkSync } from "fs";
 import { Readable } from "stream";
-import { take } from "../../_lib/multicam-store";
+import { take } from "../../../_lib/multicam-store";
 
 export const runtime = "nodejs";
 

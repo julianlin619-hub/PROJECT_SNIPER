@@ -70,7 +70,7 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
     };
 
     try {
-      const res = await fetch("/api/multicam-export", {
+      const res = await fetch("/api/segmenter/multicam-export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -158,7 +158,7 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
                 if (msg.downloadId && !downloadTriggered) {
                   downloadTriggered = true;
                   setMcStatus("Downloading…");
-                  window.location.href = `/api/multicam-download/${msg.downloadId}`;
+                  window.location.href = `/api/segmenter/multicam-download/${msg.downloadId}`;
                 }
                 break;
             }

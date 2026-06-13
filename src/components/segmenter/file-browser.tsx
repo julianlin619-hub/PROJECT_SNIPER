@@ -81,7 +81,7 @@ export default function FileBrowser({ onComplete }: Props) {
     setPickError(null);
     const isAudioSlot = slot === "lav1" || slot === "lav2";
     try {
-      const res = await fetch("/api/pick-file", {
+      const res = await fetch("/api/segmenter/pick-file", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -111,7 +111,7 @@ export default function FileBrowser({ onComplete }: Props) {
     setSegError(null);
     let segs: SegmentGroup[] = [];
     try {
-      const res = await fetch("/api/segment", {
+      const res = await fetch("/api/segmenter/segment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript: t, prompt: DEFAULT_SEGMENT_PROMPT }),
@@ -136,7 +136,7 @@ export default function FileBrowser({ onComplete }: Props) {
     const stderrChunks: string[] = [];
 
     try {
-      const res = await fetch("/api/transcribe", {
+      const res = await fetch("/api/segmenter/transcribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filePath: videoPath }),
