@@ -137,12 +137,12 @@ export default function PromptStep({ transcript, speakerMap, onComplete }: Props
               </button>
               <button
                 onClick={() => setView("edited")}
-                className={`text-xs font-medium px-2 py-0.5 rounded ${view === "edited" ? "bg-violet-600 text-white" : "text-neutral-400 hover:text-neutral-200"}`}
+                className={`text-xs font-medium px-2 py-0.5 rounded ${view === "edited" ? "bg-amber-600 text-white" : "text-neutral-400 hover:text-neutral-200"}`}
               >
                 Edited
               </button>
             </div>
-            {generating && <span className="inline-block w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />}
+            {generating && <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />}
           </div>
           <pre className="p-3 text-xs text-neutral-300 font-mono overflow-y-auto whitespace-pre-wrap" style={{ maxHeight: "480px" }}>
             {view === "decisions"
@@ -175,7 +175,7 @@ export default function PromptStep({ transcript, speakerMap, onComplete }: Props
 
       {!rawOutput && generating && (
         <div className="flex items-center gap-2 text-neutral-500 text-sm mb-5">
-          <span className="inline-block w-0.5 h-4 bg-violet-400 animate-pulse align-middle" />
+          <span className="inline-block w-0.5 h-4 bg-amber-400 animate-pulse align-middle" />
           <span>Generating edit decisions</span>
         </div>
       )}

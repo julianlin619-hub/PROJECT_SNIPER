@@ -224,14 +224,14 @@ export default function FileBrowser({ onComplete }: Props) {
             </div>
 
             {bCamPath ? (
-              <div className="rounded-xl border-2 border-violet-500 bg-violet-950/30 p-4 transition-colors">
+              <div className="rounded-xl border-2 border-amber-500 bg-amber-950/30 p-4 transition-colors">
                 <div className="flex items-start justify-between mb-2">
                   <span className="text-xs font-semibold uppercase tracking-wider text-neutral-400">Camera B · optional</span>
                   <button onClick={() => { setBCamPath(""); setBCamName(""); }} className="text-neutral-500 hover:text-neutral-300 text-xs">✕</button>
                 </div>
                 <p className="text-sm font-semibold text-white mb-1">Secondary camera</p>
                 <p className="text-xs text-neutral-500 mb-3">Stacked above A on lane 1 · video only</p>
-                <div className="flex items-center gap-2 mb-3"><span className="text-lg">🎬</span><span className="text-xs text-violet-300 font-mono truncate">{bCamName}</span></div>
+                <div className="flex items-center gap-2 mb-3"><span className="text-lg">🎬</span><span className="text-xs text-amber-300 font-mono truncate">{bCamName}</span></div>
                 <Button size="sm" variant="outline" onClick={() => pickVideo("B")}
                   className="w-full text-xs border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-neutral-300">
                   Replace...
@@ -255,7 +255,7 @@ export default function FileBrowser({ onComplete }: Props) {
             <Button
               onClick={startTranscription}
               disabled={!canTranscribe}
-              className="w-full bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-30 disabled:cursor-not-allowed font-semibold"
+              className="w-full bg-amber-600 text-white hover:bg-amber-500 disabled:opacity-30 disabled:cursor-not-allowed font-semibold"
             >
               {canTranscribe ? "Transcribe →" : "Select Camera A to transcribe"}
             </Button>
@@ -309,7 +309,7 @@ export default function FileBrowser({ onComplete }: Props) {
           ) : (
             <div className="rounded-xl border border-neutral-800 bg-neutral-900/30 p-5 mb-4">
               <div className="flex items-center gap-3 mb-3">
-                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${txStatus === "done" ? "bg-green-500" : txStatus === "error" ? "bg-red-500" : "bg-violet-500 animate-pulse"}`} />
+                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${txStatus === "done" ? "bg-green-500" : txStatus === "error" ? "bg-red-500" : "bg-amber-500 animate-pulse"}`} />
                 <span className="text-sm text-neutral-200 flex-1">{txStatusText}</span>
               </div>
               {txStatus !== "error" && <Progress value={txProgress} className="h-1.5" />}
@@ -337,7 +337,7 @@ export default function FileBrowser({ onComplete }: Props) {
                       <span className="text-[9px] text-neutral-600 px-1">{label}</span>
                       <div className={`max-w-[85%] rounded-2xl px-3 py-2 text-xs leading-relaxed ${
                         isRight
-                          ? "bg-violet-600 text-white rounded-br-sm"
+                          ? "bg-amber-600 text-white rounded-br-sm"
                           : "bg-neutral-700 text-neutral-100 rounded-bl-sm"
                       }`}>
                         {entry.text}
@@ -363,7 +363,7 @@ export default function FileBrowser({ onComplete }: Props) {
                   buildSource(pendingComplete.duration, pendingComplete.fps, pendingComplete.stereo ?? false),
                   pendingComplete.stereo,
                 )}
-                className="flex-1 text-xs px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition-colors"
+                className="flex-1 text-xs px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-medium transition-colors"
               >
                 Continue to Edit →
               </button>

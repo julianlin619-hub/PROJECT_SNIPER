@@ -49,13 +49,13 @@ export default function ExportStep({ versionWords, source, transcript = [], spea
               });
             } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
           }}
-          className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-violet-500/50 bg-violet-950/30 hover:bg-violet-950/50 hover:border-violet-400 transition-all group"
+          className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-amber-500/50 bg-amber-950/30 hover:bg-amber-950/50 hover:border-amber-400 transition-all group"
         >
           <div className="text-left">
-            <p className="text-sm font-semibold text-violet-200">
+            <p className="text-sm font-semibold text-amber-200">
               {isMultiCam ? "Export A+B FCPXML" : "Export FCPXML"}
             </p>
-            <p className="text-xs text-violet-400/70 mt-0.5">
+            <p className="text-xs text-amber-400/70 mt-0.5">
               {versionWords.length > 1
                 ? `${versionWords.length} files · one FCPXML per version`
                 : isMultiCam
@@ -63,7 +63,7 @@ export default function ExportStep({ versionWords, source, transcript = [], spea
                 : "FCPXML generated from your edits · ready to import"}
             </p>
           </div>
-          <span className="text-violet-400 group-hover:text-violet-200 transition-colors text-lg">⬇</span>
+          <span className="text-amber-400 group-hover:text-amber-200 transition-colors text-lg">⬇</span>
         </button>
         {error && <p className="text-sm text-red-400 px-1">{error}</p>}
       </div>
