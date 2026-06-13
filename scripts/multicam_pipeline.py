@@ -22,9 +22,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
 from pathlib import Path
 
@@ -36,17 +40,77 @@ from scipy.signal import fftconvolve
 MUXABLE_AUDIO = {"aac", "mp3", "ac3", "opus", "alac"}
 MIN_FFMPEG_VERSION = (4, 4)
 
+# Pre/post-roll padding added to every cut so boundaries don't clip the first or
+# last word. Matches scripts/export_mp4.py (single-cam). Applied identically
+# across all cameras (after offset translation) so sync is preserved.
+PAD_SECONDS = 5.0
+
 
 def run_command(cmd):
+    t = time.monotonic()
+    if DEBUG:
+        dbg("$ " + " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout).strip().splitlines()[-15:]
+        if DEBUG:
+            dbg("FAILED", bin=os.path.basename(cmd[0]), code=result.returncode,
+                secs=round(time.monotonic() - t, 2))
+            for ln in tail:
+                dbg("  ! " + ln)
         raise RuntimeError("\n".join(tail) or f"{cmd[0]} failed")
+    if DEBUG:
+        dbg("ok", bin=os.path.basename(cmd[0]), secs=round(time.monotonic() - t, 2))
     return result.stdout.strip()
 
 
+_log_lock = threading.Lock()
+
+# Verbose tracing for debugging a render. Goes to STDERR (not stdout, which the
+# SSE route parses as JSON status events) — the export route mirrors stderr live
+# to the `npm run dev` console. Enable with MULTICAM_DEBUG=1. Lines are prefixed
+# with elapsed seconds and tagged with a thread/segment label where relevant.
+DEBUG = os.environ.get("MULTICAM_DEBUG") == "1"
+_t0 = time.monotonic()
+
+
 def log_status(**fields):
-    print(json.dumps(fields), flush=True)
+    # Serialized: segments are cut concurrently and each status line is parsed
+    # as one JSON object by the SSE route — interleaved writes would corrupt it.
+    line = json.dumps(fields)
+    with _log_lock:
+        print(line, flush=True)
+
+
+_ctx = threading.local()
+
+
+class log_context:
+    """Tag every dbg line emitted on this thread with `label` (e.g. 'seg0/b').
+    Because segments are cut concurrently, the $command / ok lines from
+    different workers interleave on stderr — the tag lets you tell them apart."""
+
+    def __init__(self, label):
+        self.label = label
+
+    def __enter__(self):
+        self.prev = getattr(_ctx, "label", "")
+        _ctx.label = self.label
+
+    def __exit__(self, *exc):
+        _ctx.label = self.prev
+
+
+def dbg(msg, **fields):
+    if not DEBUG:
+        return
+    label = getattr(_ctx, "label", "")
+    tag = f"[{label}] " if label else ""
+    extra = "  ".join(f"{k}={v}" for k, v in fields.items())
+    line = (f"[mc +{time.monotonic() - _t0:7.2f}s] {tag}{msg}"
+            + (f"  |  {extra}" if extra else ""))
+    with _log_lock:
+        print(line, file=sys.stderr, flush=True)
 
 
 def safe_name(s):
@@ -96,6 +160,22 @@ def ffprobe_audio_info(path):
         "sample_rate": int(s["sample_rate"]) if s.get("sample_rate") else None,
         "channels": int(s["channels"]) if s.get("channels") else None,
     }
+
+
+def ffprobe_video_params(path):
+    """Stream params needed to make re-encoded boundary GOPs seam-compatible
+    with the stream-copied middle (pix_fmt, profile/level, SAR, color, timebase,
+    fps). Missing/unknown fields are simply omitted by the arg builder."""
+    out = run_command([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries",
+        "stream=codec_name,pix_fmt,profile,level,sample_aspect_ratio,color_range,"
+        "color_space,color_transfer,color_primaries,time_base,r_frame_rate",
+        "-of", "json", path,
+    ])
+    streams = json.loads(out).get("streams", [])
+    return streams[0] if streams else {}
 
 
 def check_ffmpeg_version():
@@ -248,8 +328,12 @@ def round_offset_to_frame(offset_s, fps):
 
 # ---------- segment cutting ----------
 
-def cut_segment(src, start, dur, out, audio_copy):
+def full_reencode_segment(src, start, dur, out, audio_copy):
     """Re-encode a frame-accurate clip from `src` covering [start, start+dur].
+
+    This is the legacy full-segment path (every frame re-encoded). It is now
+    used (a) when --cut-method reencode is forced, and (b) as the per-clip
+    fallback when smartcut's seam validation fails. Seam-free by definition.
 
     Uses the fast input-seek + accurate output-seek pattern (same reason as
     extract_audio_window). Pure input-side -ss on ffmpeg 8.0.1 produces
@@ -277,13 +361,369 @@ def cut_segment(src, start, dur, out, audio_copy):
     run_command(cmd)
 
 
+# ---------- smartcut: re-encode only the boundary GOPs, copy the middle ----------
+
+_PROFILE_MAP = {
+    "constrained baseline": "baseline",
+    "baseline": "baseline",
+    "main": "main",
+    "high": "high",
+    "high 10": "high10",
+    "high 4:2:2": "high422",
+    "high 4:4:4 predictive": "high444",
+}
+
+
+def list_keyframes(src, start, end):
+    """Sorted keyframe pts_times (seconds) within ~[start, end], read from
+    packet flags (no decode). The window is widened slightly so a keyframe
+    sitting exactly on a boundary isn't missed."""
+    lo = max(0.0, start - 0.5)
+    out = run_command([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-read_intervals", f"{lo:.3f}%{end + 0.5:.3f}",
+        "-show_entries", "packet=pts_time,flags",
+        "-of", "csv=p=0",
+        src,
+    ])
+    kfs = []
+    for line in out.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 2 or "K" not in parts[1]:
+            continue
+        try:
+            kfs.append(float(parts[0]))
+        except ValueError:
+            pass
+    kfs.sort()
+    return kfs
+
+
+def _x264_match_args(vparams):
+    """libx264 -crf 18 args that mirror the source's pixel/profile/color params
+    so a re-encoded boundary piece concatenates cleanly with the copied middle.
+
+    Preset is `veryfast`, NOT for quality reasons (CRF 18 fixes the quality
+    target) but for speed: the boundary GOPs are tiny, transient pieces glued
+    between lossless copy, so their encode *efficiency* is irrelevant — only
+    wall-clock matters, and on heavy sources (4K 10-bit 4:2:2, long GOPs) a
+    near-full-GOP boundary at `fast` can take ~40s. `veryfast` keeps CABAC and
+    the high-profile feature set (unlike `ultrafast`), so the seam stays clean."""
+    args = ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast"]
+    pix = vparams.get("pix_fmt")
+    if pix and pix != "unknown":
+        args += ["-pix_fmt", pix]
+    profile = _PROFILE_MAP.get((vparams.get("profile") or "").lower())
+    if profile:
+        args += ["-profile:v", profile]
+    # NOTE: deliberately do NOT force -level. The copied middle keeps its own
+    # SPS, so the re-encoded pieces don't need a matching level to concat, and
+    # forcing it risks an invalid value (e.g. ffprobe reports level 1b as 9 ->
+    # "0.9", which libx264 rejects). libx264 picks a compatible level itself.
+    for key, flag in (
+        ("color_primaries", "-color_primaries"),
+        ("color_transfer", "-color_trc"),
+        ("color_space", "-colorspace"),
+        ("color_range", "-color_range"),
+    ):
+        val = vparams.get(key)
+        if val and val not in ("unknown", "unspecified", "reserved"):
+            args += [flag, val]
+    return args
+
+
+def reencode_video_only(src, start, dur, out, vparams):
+    """Re-encode a frame-accurate video-only piece (head or tail GOP)."""
+    start = max(0.0, start)
+    pre_seek = max(0.0, start - 5.0)
+    fine_seek = start - pre_seek
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    if pre_seek > 0:
+        cmd += ["-ss", f"{pre_seek:.3f}"]
+    cmd += ["-i", src]
+    if fine_seek > 0:
+        cmd += ["-ss", f"{fine_seek:.3f}"]
+    cmd += ["-t", f"{dur:.3f}", "-an", *_x264_match_args(vparams)]
+    sar = vparams.get("sample_aspect_ratio")
+    if sar and re.fullmatch(r"\d+:\d+", sar) and sar != "0:1":
+        cmd += ["-vf", f"setsar={sar.replace(':', '/')}"]
+    rfr = vparams.get("r_frame_rate")
+    if rfr and rfr not in ("0/0", "0/1"):
+        cmd += ["-r", rfr, "-fps_mode", "cfr"]
+    tb = vparams.get("time_base")
+    if tb and "/" in tb:
+        cmd += ["-video_track_timescale", tb.split("/")[1]]
+    cmd += ["-avoid_negative_ts", "make_zero", out]
+    run_command(cmd)
+
+
+def copy_video_only(src, start, dur, out):
+    """Stream-copy whole GOPs [start, start+dur). `start` must be a keyframe."""
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.3f}", "-i", src,
+        "-t", f"{dur:.3f}",
+        "-an", "-c:v", "copy",
+        "-avoid_negative_ts", "make_zero",
+        out,
+    ]
+    run_command(cmd)
+
+
+def extract_audio_clip(src, start, dur, out, audio_copy):
+    """Single-pass audio cut for the whole window (never spliced), so there are
+    no audio seams to worry about. Muxed back onto the spliced video."""
+    start = max(0.0, start)
+    pre_seek = max(0.0, start - 5.0)
+    fine_seek = start - pre_seek
+    audio_args = ["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "192k"]
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    if pre_seek > 0:
+        cmd += ["-ss", f"{pre_seek:.3f}"]
+    cmd += ["-i", src]
+    if fine_seek > 0:
+        cmd += ["-ss", f"{fine_seek:.3f}"]
+    cmd += ["-t", f"{dur:.3f}", "-vn", "-map", "0:a:0", *audio_args, out]
+    run_command(cmd)
+
+
+def concat_copy(parts, out, work_dir):
+    """Lossless concat of H.264 pieces via the MPEG-TS protocol. Remuxing each
+    piece to annex-B TS and joining with `concat:` regenerates clean, monotonic
+    timestamps across the seam — the MP4 concat *demuxer* leaves non-monotonic
+    DTS where a re-encoded piece meets a copied (B-frame) piece."""
+    ts_parts = []
+    for idx, p in enumerate(parts):
+        ts = os.path.join(work_dir, f"part_{idx}.ts")
+        run_command([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", p, "-c", "copy", "-bsf:v", "h264_mp4toannexb",
+            "-f", "mpegts", ts,
+        ])
+        ts_parts.append(ts)
+    run_command([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-fflags", "+genpts",
+        "-i", "concat:" + "|".join(ts_parts),
+        "-c", "copy", "-avoid_negative_ts", "make_zero",
+        out,
+    ])
+
+
+def count_video_packets(path):
+    out = run_command([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-count_packets", "-show_entries", "stream=nb_read_packets",
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
+    ])
+    return int(out.strip().splitlines()[0])
+
+
+def mux_av(video_only, audio, out):
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_only]
+    if audio:
+        cmd += ["-i", audio]
+    cmd += ["-c", "copy", "-map", "0:v:0"]
+    if audio:
+        cmd += ["-map", "1:a:0"]
+    cmd += ["-movflags", "+faststart", out]
+    run_command(cmd)
+
+
+def smartcut_video(src, cut_start, cut_end, out, audio_copy, has_audio, vparams, fps):
+    """Frame-accurate cut that re-encodes only the partial GOPs at each
+    boundary and stream-copies the whole GOPs between. Returns a list of
+    *seam positions* (seconds into the output clip, one per re-encode↔copy
+    junction) on success — possibly empty (pure copy, no seams). Returns None
+    if the window can't be smartcut (too few keyframes) — caller then falls
+    back to a full re-encode. Raises on ffmpeg failure (also caught by the
+    caller as a fallback trigger). The seam list lets validate_seam decode
+    only around the junctions instead of the whole clip.
+
+    `-c copy` is not frame-exact at its tail (it stops on a packet boundary and
+    can spill a couple of frames into the next GOP), so we measure how many
+    frames the copy actually produced and start the tail re-encode exactly
+    where the copy ended. That makes head/copy/tail strictly contiguous — no
+    overlap (which caused non-monotonic DTS) and no gap.
+    """
+    name = os.path.basename(src)
+    dbg("smartcut start", src=name, window=f"[{cut_start:.3f},{cut_end:.3f}]",
+        dur=round(cut_end - cut_start, 3))
+    # Boundary GOPs are re-encoded with libx264 (H.264); concat with the copied
+    # middle is only valid if the source is also H.264. Other codecs → fall back.
+    if (vparams.get("codec_name") or "").lower() != "h264":
+        dbg("smartcut skip: source not H.264", src=name, codec=vparams.get("codec_name"))
+        return None
+    fps_f = float(fps)
+    half_frame = 0.5 / fps_f
+    kfs = list_keyframes(src, cut_start, cut_end)
+    # Tight epsilon (FP equality only). A keyframe more than ~1us before
+    # cut_start is NOT treated as "on the boundary" — it's excluded so the head
+    # re-encode fills [cut_start, next keyframe) and the start stays frame-exact.
+    starts = [k for k in kfs if k >= cut_start - 1e-6]
+    ends = [k for k in kfs if k <= cut_end + 1e-6]
+    if not starts or not ends:
+        dbg("smartcut skip: no keyframe in range", src=name, keyframes=len(kfs))
+        return None
+    middle_start = starts[0]
+    middle_end = ends[-1]
+    if middle_end - middle_start <= half_frame:
+        dbg("smartcut skip: no copyable whole-GOP region", src=name,
+            middle_start=round(middle_start, 3), middle_end=round(middle_end, 3))
+        return None  # no copyable whole-GOP region
+    dbg("smartcut keyframes", src=name, n=len(kfs),
+        middle_start=round(middle_start, 3), middle_end=round(middle_end, 3))
+
+    with tempfile.TemporaryDirectory(prefix="smartcut-") as work:
+        parts = []
+        # Junction positions in OUTPUT time, for targeted seam validation.
+        seams = []
+        head_dur = 0.0
+        if middle_start - cut_start > half_frame:
+            head = os.path.join(work, "head.mp4")
+            dbg("smartcut head reencode", src=name,
+                span=f"[{cut_start:.3f},{middle_start:.3f}]")
+            reencode_video_only(src, cut_start, middle_start - cut_start, head, vparams)
+            parts.append(head)
+            head_dur = middle_start - cut_start
+        else:
+            dbg("smartcut no head (cut_start on keyframe)", src=name)
+
+        mid = os.path.join(work, "mid.mp4")
+        copy_video_only(src, middle_start, middle_end - middle_start, mid)
+        parts.append(mid)
+
+        # Where the copy actually ended in source time (it may overshoot
+        # middle_end by a frame or two). Fill [copy_end, cut_end] by re-encode.
+        n_copy = count_video_packets(mid)
+        copy_dur = n_copy / fps_f
+        copy_end = middle_start + copy_dur
+        dbg("smartcut copy", src=name, copied_frames=n_copy,
+            copy_end=round(copy_end, 3))
+        if head_dur > 0:
+            seams.append(head_dur)  # head → copy junction
+        if cut_end - copy_end > half_frame:
+            tail = os.path.join(work, "tail.mp4")
+            dbg("smartcut tail reencode", src=name,
+                span=f"[{copy_end:.3f},{cut_end:.3f}]")
+            reencode_video_only(src, copy_end, cut_end - copy_end, tail, vparams)
+            parts.append(tail)
+            seams.append(head_dur + copy_dur)  # copy → tail junction
+        else:
+            dbg("smartcut no tail (copy reached end)", src=name)
+
+        video_only = os.path.join(work, "video_only.mp4")
+        if len(parts) == 1:
+            shutil.copy(parts[0], video_only)
+        else:
+            dbg("smartcut concat", src=name, pieces=len(parts))
+            concat_copy(parts, video_only, work)
+
+        audio_path = None
+        if has_audio:
+            audio_path = os.path.join(work, "audio.m4a")
+            extract_audio_clip(src, cut_start, cut_end - cut_start, audio_path, audio_copy)
+        else:
+            dbg("smartcut no audio stream", src=name)
+        mux_av(video_only, audio_path, out)
+    dbg("smartcut done", src=name, out=os.path.basename(out), seams=[round(s, 3) for s in seams])
+    return seams
+
+
+# Seconds decoded on each side of a splice junction during seam validation.
+SEAM_PROBE_PAD = 2.0
+
+
+def _decode_clean(clip, ss=None, t=None):
+    """Decode (a window of) `clip` and report whether it's free of *decoder*
+    errors. The `non monotonically increasing dts to muxer` line is a benign
+    *muxer* bookkeeping warning at a concat seam (frames decode fine) and is
+    ignored."""
+    cmd = ["ffmpeg", "-v", "error"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.3f}"]
+    cmd += ["-i", clip]
+    if t is not None:
+        cmd += ["-t", f"{t:.3f}"]
+    cmd += ["-f", "null", "-"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    for line in res.stderr.splitlines():
+        if not line.strip():
+            continue
+        if "non monotonically increasing dts" in line.lower():
+            continue
+        dbg("seam REJECT: decoder error", clip=os.path.basename(clip), line=line)
+        return False
+    return True
+
+
+def validate_seam(clip, expected_dur, fps, seams):
+    """True if `clip` has ~the expected frame count AND each splice junction
+    decodes without corruption.
+
+    The copied middle is bit-identical to the source, so a glitch can only
+    appear at a re-encode↔copy junction — we decode just a ±SEAM_PROBE_PAD
+    window around each (input-side -ss seeks to the keyframe before it, so the
+    junction is reconstructed with real references) instead of the whole clip.
+    The frame-count check (packet count, no decode) still guarantees the whole
+    clip is contiguous — no missing or extra frames."""
+    try:
+        n = count_video_packets(clip)
+    except Exception:
+        dbg("seam REJECT: could not count packets", clip=os.path.basename(clip))
+        return False
+    expected = round(expected_dur * float(fps))
+    if abs(n - expected) > 2:
+        dbg("seam REJECT: frame-count mismatch", clip=os.path.basename(clip),
+            frames=n, expected=expected)
+        return False
+    for s in seams:
+        if not _decode_clean(clip, ss=max(0.0, s - SEAM_PROBE_PAD), t=2 * SEAM_PROBE_PAD):
+            return False
+    return True
+
+
+def cut_video_clip(src, cut_start, cut_end, out, audio_copy, has_audio,
+                   vparams, cut_method, fps, label=""):
+    """Produce a frame-accurate clip and return which method was used:
+    'smartcut', 'reencode_fallback', or 'reencode' (forced)."""
+    dur = cut_end - cut_start
+    t = time.monotonic()
+    with log_context(label):
+        if cut_method == "smartcut":
+            try:
+                seams = smartcut_video(src, cut_start, cut_end, out, audio_copy,
+                                       has_audio, vparams, fps)
+                if seams is not None:  # [] is a valid (seamless pure-copy) result
+                    if validate_seam(out, dur, fps, seams):
+                        dbg("CUT smartcut OK", seams=len(seams),
+                            secs=round(time.monotonic() - t, 2))
+                        return "smartcut"
+                    dbg("CUT smartcut REJECTED by seam validation -> reencode")
+                else:
+                    dbg("CUT smartcut not applicable -> reencode")
+            except Exception as exc:
+                dbg("CUT smartcut ERROR -> reencode",
+                    error=f"{type(exc).__name__}: {exc}")
+                log_status(status="smartcut_error", src=os.path.basename(src),
+                           error=f"{type(exc).__name__}: {exc}")
+            full_reencode_segment(src, cut_start, dur, out, audio_copy)
+            dbg("CUT reencode_fallback done", secs=round(time.monotonic() - t, 2))
+            return "reencode_fallback"
+        full_reencode_segment(src, cut_start, dur, out, audio_copy)
+        dbg("CUT reencode (forced) done", secs=round(time.monotonic() - t, 2))
+        return "reencode"
+
+
 def cut_audio_segment(src, start, dur, out):
     """Sample-accurate PCM WAV clip from an audio-only source.
 
     Always decodes to pcm_s16le so the output is uniform regardless of input
     container (.wav/.mp3/.m4a/.aac/.flac/.ogg/.opus). Source channel count is
     preserved (no -ac flag — don't downmix). Same dual-seek pattern as
-    cut_segment / extract_audio_window for sample-precise trim boundaries.
+    full_reencode_segment / extract_audio_window for sample-precise trim
+    boundaries.
     """
     start = max(0.0, start)
     pre_seek = max(0.0, start - 5.0)
@@ -301,6 +741,39 @@ def cut_audio_segment(src, start, dur, out):
         out,
     ]
     run_command(cmd)
+
+
+# Largest audio shortfall (seconds) we silence-pad rather than drop the track.
+AUDIO_SILENCE_PAD_MAX = 0.5
+
+
+def cut_audio_segment_window(src, lo, hi, src_dur, out):
+    """Cut [lo, hi] from an audio source. If the window extends past the
+    source's bounds [0, src_dur], pad the missing end(s) with silence so the
+    real samples keep their correct position in the output window (prepend for
+    a late start, append for an early end — never shift the existing audio).
+    Returns (head_pad, tail_pad) seconds of silence added."""
+    window = hi - lo
+    head_pad = max(0.0, -lo)
+    tail_pad = max(0.0, hi - src_dur)
+    avail_lo = max(0.0, lo)
+    avail_dur = min(src_dur, hi) - avail_lo
+    if head_pad <= 1e-6 and tail_pad <= 1e-6:
+        cut_audio_segment(src, avail_lo, avail_dur, out)
+        return (0.0, 0.0)
+    with tempfile.TemporaryDirectory(prefix="lavpad-") as work:
+        raw = os.path.join(work, "raw.wav")
+        cut_audio_segment(src, avail_lo, avail_dur, raw)  # sample-accurate
+        af = []
+        if head_pad > 1e-6:
+            af.append(f"adelay={int(round(head_pad * 1000))}:all=1")  # prepend silence
+        af.append(f"apad=whole_dur={window:.6f}")                     # fill to window len
+        run_command([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", raw, "-af", ",".join(af),
+            "-c:a", "pcm_s16le", "-f", "wav", out,
+        ])
+    return (head_pad, tail_pad)
 
 
 # ---------- validation ----------
@@ -391,6 +864,14 @@ def parse_args():
                    help="Max plausible offset (s) of any alt source after A.")
     p.add_argument("--tolerance-frames", type=float, default=1.5,
                    help="Allowed sync drift (A-cam frames). Re-encode can shift PTS ~10-40ms; 1.5 is safer than 1.")
+    p.add_argument("--cut-method", choices=["smartcut", "reencode"], default="smartcut",
+                   help="smartcut (default): re-encode only the boundary GOPs at "
+                        "libx264 -crf 18 and stream-copy the whole GOPs between. "
+                        "reencode: full libx264 -crf 18 re-encode of every segment "
+                        "(legacy). Per-clip fallback to full re-encode happens "
+                        "automatically when a smartcut seam fails validation.")
+    p.add_argument("--workers", type=int, default=None,
+                   help="Parallel segment workers. Default min(4, cpu_count).")
     p.add_argument("--skip-validation", action="store_true")
     p.add_argument("--zip-out", default=None,
                    help="If set, bundle the outdir into a ZIP at this path after success.")
@@ -443,21 +924,26 @@ def main():
                c_duration=c_dur, lav1_duration=l1_dur, lav2_duration=l2_dur,
                a_fps=str(fps))
 
+    cam_fps = {"a": fps}
     alt_cams = []
     if args.bcam:
-        alt_cams.append(("B", args.bcam))
+        alt_cams.append(("B", "b", args.bcam))
     if args.ccam:
-        alt_cams.append(("C", args.ccam))
-    for cam_name, cam_path in alt_cams:
+        alt_cams.append(("C", "c", args.ccam))
+    for cam_name, cam_key, cam_path in alt_cams:
         try:
             other_fps = ffprobe_frame_rate(cam_path)
+            cam_fps[cam_key] = other_fps
             if other_fps != fps:
                 log_status(status="warn", reason="fps_mismatch",
                            cam=cam_name, a_fps=str(fps), cam_fps=str(other_fps))
         except Exception as e:
+            cam_fps[cam_key] = fps
             log_status(status="warn", reason="fps_unreadable", cam=cam_name, detail=str(e))
 
     audio_copy = {}
+    has_audio = {}
+    vparams = {}
     cam_paths = [("a", args.acam)]
     if args.bcam:
         cam_paths.append(("b", args.bcam))
@@ -465,9 +951,11 @@ def main():
         cam_paths.append(("c", args.ccam))
     for name, path in cam_paths:
         info = ffprobe_audio_info(path)
+        has_audio[name] = info["codec_name"] is not None
         ok = (info["codec_name"] or "").lower() in MUXABLE_AUDIO
         audio_copy[name] = ok
-        if not ok:
+        vparams[name] = ffprobe_video_params(path)
+        if has_audio[name] and not ok:
             log_status(status="warn", reason="audio_codec_not_muxable",
                        cam=name, codec=info["codec_name"], fallback="aac@192k")
 
@@ -475,6 +963,7 @@ def main():
     c_offset = None
     l1_offset = None
     l2_offset = None
+    _ctx.label = "offset"  # tag the xcorr-phase log lines (main thread)
     with tempfile.TemporaryDirectory(prefix="multicam-xcorr-") as tmp:
         if args.bcam:
             b_raw = estimate_offset("B", args.acam, args.bcam, a_dur, b_dur,
@@ -487,15 +976,16 @@ def main():
                                     args.probe_dur, args.max_offset, tmp)
             c_offset = round_offset_to_frame(c_raw, fps)
         if args.lav1:
-            l1_raw = estimate_offset("L1", args.acam, args.lav1, a_dur, l1_dur,
-                                     args.coarse_sr, args.fine_sr,
-                                     args.probe_dur, args.max_offset, tmp)
-            l1_offset = round_offset_to_frame(l1_raw, fps)
+            # Audio-only: keep the raw (sub-frame) offset. cut_audio_segment is
+            # sample-accurate, so rounding to the video frame grid would only
+            # throw away up to half a frame of genuine sync precision.
+            l1_offset = estimate_offset("L1", args.acam, args.lav1, a_dur, l1_dur,
+                                        args.coarse_sr, args.fine_sr,
+                                        args.probe_dur, args.max_offset, tmp)
         if args.lav2:
-            l2_raw = estimate_offset("L2", args.acam, args.lav2, a_dur, l2_dur,
-                                     args.coarse_sr, args.fine_sr,
-                                     args.probe_dur, args.max_offset, tmp)
-            l2_offset = round_offset_to_frame(l2_raw, fps)
+            l2_offset = estimate_offset("L2", args.acam, args.lav2, a_dur, l2_dur,
+                                        args.coarse_sr, args.fine_sr,
+                                        args.probe_dur, args.max_offset, tmp)
     log_status(status="offsets_rounded",
                b_offset=round(b_offset, 4) if b_offset is not None else None,
                c_offset=round(c_offset, 4) if c_offset is not None else None,
@@ -534,156 +1024,227 @@ def main():
     write_manifest_atomic(manifest_path, manifest)
 
     pad = max(3, len(str(len(validated))))
-    for i, seg in enumerate(validated):
-        title = safe_name(str(seg.get("title") or f"segment_{i:0{pad}d}"))
+
+    def process_segment(i, seg):
+        """Cut every camera/lav for one segment and return its manifest entry.
+        Pure w.r.t. shared state — safe to run concurrently across segments."""
+        # Tag every dbg line from this worker with the segment (cut_video_clip
+        # refines it to seg{i}/{cam}); makes the interleaved parallel log
+        # readable. Each worker only runs process_segment, so a plain set is
+        # fine — the next segment on this thread overwrites it.
+        _ctx.label = f"seg{i}"
         base = f"segment_{i:0{pad}d}.mp4"
+        wav_base = f"segment_{i:0{pad}d}.wav"
         entry = {
-            "index": i, "title": title,
+            "index": i, "title": safe_name(str(seg.get("title") or f"segment_{i:0{pad}d}")),
             "a_start": seg.get("start"), "a_end": seg.get("end"),
             "acam_clip": None, "bcam_clip": None, "ccam_clip": None,
             "lav1_clip": None, "lav2_clip": None,
             "bcam_available": False, "ccam_available": False,
             "lav1_available": False, "lav2_available": False,
+            "acam_method": None, "bcam_method": None, "ccam_method": None,
             "error": None,
         }
 
         if "validation_error" in seg:
             entry["error"] = seg["validation_error"]
-            manifest["segments"].append(entry)
-            write_manifest_atomic(manifest_path, manifest)
             log_status(status="segment_skipped", index=i, reason=seg["validation_error"])
-            continue
+            dbg("segment SKIP (invalid)", seg=i, reason=seg["validation_error"])
+            return entry
 
+        seg_t = time.monotonic()
         try:
             a_start = float(seg["start"])
             a_end = float(seg["end"])
-            dur = a_end - a_start
-            avail = ["a"]
 
-            a_out = outdir / "acam_clips" / base
-            cut_segment(args.acam, a_start, dur, str(a_out), audio_copy["a"])
-            entry["acam_clip"] = str(a_out.relative_to(outdir))
-
+            # All candidate sources for this segment (A is the reference, offset 0).
+            candidates = [
+                ("a", "video", args.acam, 0.0, a_dur, outdir / "acam_clips" / base,
+                 "acam_clip", "acam_method"),
+            ]
             if args.bcam:
-                b_start = a_start - b_offset
-                b_end = a_end - b_offset
-                if b_start >= 0.0 and b_end <= b_dur:
-                    b_out = outdir / "bcam_clips" / base
-                    cut_segment(args.bcam, b_start, dur, str(b_out), audio_copy["b"])
-                    entry["bcam_clip"] = str(b_out.relative_to(outdir))
-                    entry["bcam_available"] = True
-                    avail.append("b")
-
+                candidates.append(("b", "video", args.bcam, b_offset, b_dur,
+                                   outdir / "bcam_clips" / base, "bcam_clip", "bcam_method"))
             if args.ccam:
-                c_start = a_start - c_offset
-                c_end = a_end - c_offset
-                if c_start >= 0.0 and c_end <= c_dur:
-                    c_out = outdir / "ccam_clips" / base
-                    cut_segment(args.ccam, c_start, dur, str(c_out), audio_copy["c"])
-                    entry["ccam_clip"] = str(c_out.relative_to(outdir))
-                    entry["ccam_available"] = True
-                    avail.append("c")
-
-            wav_base = f"segment_{i:0{pad}d}.wav"
-
+                candidates.append(("c", "video", args.ccam, c_offset, c_dur,
+                                   outdir / "ccam_clips" / base, "ccam_clip", "ccam_method"))
             if args.lav1:
-                l1_start = a_start - l1_offset
-                l1_end = a_end - l1_offset
-                if l1_start >= 0.0 and l1_end <= l1_dur:
-                    l1_out = outdir / "lav1_clips" / wav_base
-                    cut_audio_segment(args.lav1, l1_start, dur, str(l1_out))
-                    entry["lav1_clip"] = str(l1_out.relative_to(outdir))
-                    entry["lav1_available"] = True
-                    avail.append("l1")
-
+                candidates.append(("l1", "audio", args.lav1, l1_offset, l1_dur,
+                                   outdir / "lav1_clips" / wav_base, "lav1_clip", None))
             if args.lav2:
-                l2_start = a_start - l2_offset
-                l2_end = a_end - l2_offset
-                if l2_start >= 0.0 and l2_end <= l2_dur:
-                    l2_out = outdir / "lav2_clips" / wav_base
-                    cut_audio_segment(args.lav2, l2_start, dur, str(l2_out))
-                    entry["lav2_clip"] = str(l2_out.relative_to(outdir))
-                    entry["lav2_available"] = True
-                    avail.append("l2")
+                candidates.append(("l2", "audio", args.lav2, l2_offset, l2_dur,
+                                   outdir / "lav2_clips" / wav_base, "lav2_clip", None))
+
+            # VIDEO sources define the window: include only those that fully
+            # cover the core (video can't be fabricated), and a dropped video
+            # source doesn't constrain padding. They alone determine the common
+            # pre/post-roll so every video clip shares one real-world window and
+            # stays frame-aligned (clamping per-camera would shift a clip's t=0).
+            video = [c for c in candidates if c[1] == "video"]
+            audio = [c for c in candidates if c[1] == "audio"]
+            video_included = []
+            for c in video:
+                name, offset, src_dur = c[0], c[3], c[4]
+                if (a_start - offset) < -1e-6 or (a_end - offset) > src_dur + 1e-6:
+                    log_status(status="source_dropped", index=i, source=name,
+                               reason="video does not cover the segment (cannot pad video)")
+                    dbg(f"{name} DROP: video core out of range",
+                        core_in_src=f"[{a_start - offset:.3f},{a_end - offset:.3f}]", src_dur=src_dur)
+                    continue
+                video_included.append(c)
+
+            pre = min([PAD_SECONDS] + [a_start - c[3] for c in video_included])
+            post = min([PAD_SECONDS] + [c[4] - (a_end - c[3]) for c in video_included])
+            pre = max(0.0, pre)
+            post = max(0.0, post)
+            a_lo = a_start - pre
+            a_hi = a_end + post
+
+            # AUDIO sources adapt to that window: a small shortfall is filled
+            # with silence (real samples stay put); only a large gap drops it.
+            audio_included = []
+            for c in audio:
+                name, offset, src_dur = c[0], c[3], c[4]
+                short = max(0.0, offset - a_lo) + max(0.0, (a_hi - offset) - src_dur)
+                if short > AUDIO_SILENCE_PAD_MAX:
+                    log_status(status="source_dropped", index=i, source=name,
+                               reason=f"audio short by {short:.3f}s (> {AUDIO_SILENCE_PAD_MAX}s)")
+                    dbg(f"{name} DROP: audio short by {short:.3f}s")
+                    continue
+                audio_included.append(c)
+
+            dbg("segment start", title=entry["title"],
+                core=f"[{a_start:.3f},{a_end:.3f}]", padded=f"[{a_lo:.3f},{a_hi:.3f}]",
+                pre=round(pre, 3), post=round(post, 3),
+                included=[c[0] for c in video_included + audio_included])
+            if pre < PAD_SECONDS - 1e-3 or post < PAD_SECONDS - 1e-3:
+                log_status(status="padding_reduced", index=i,
+                           pre=round(pre, 3), post=round(post, 3),
+                           reason="a source lacks runway; padding shared to keep sync")
+
+            avail = []
+            for name, kind, src, offset, src_dur, out_path, clip_key, method_key in video_included:
+                lo = max(0.0, a_lo - offset)
+                hi = min(src_dur, a_hi - offset)
+                # video source names ('a','b','c') match the per-cam dict keys
+                entry[method_key] = cut_video_clip(
+                    src, lo, hi, str(out_path),
+                    audio_copy[name], has_audio[name], vparams[name],
+                    args.cut_method, cam_fps[name], label=f"seg{i}/{name}")
+                entry[clip_key] = str(out_path.relative_to(outdir))
+                entry[clip_key.replace("_clip", "_available")] = True
+                avail.append(name)
+
+            for name, kind, src, offset, src_dur, out_path, clip_key, method_key in audio_included:
+                lo = a_lo - offset
+                hi = a_hi - offset
+                with log_context(f"seg{i}/{name}"):
+                    head_pad, tail_pad = cut_audio_segment_window(src, lo, hi, src_dur, str(out_path))
+                    if head_pad > 1e-6 or tail_pad > 1e-6:
+                        log_status(status="audio_padded", index=i, source=name,
+                                   head_pad=round(head_pad, 3), tail_pad=round(tail_pad, 3))
+                        dbg(f"padded silence head={head_pad:.3f}s tail={tail_pad:.3f}s "
+                            f"so {name} is kept")
+                entry[clip_key] = str(out_path.relative_to(outdir))
+                entry[clip_key.replace("_clip", "_available")] = True
+                avail.append(name)
 
             log_status(status="segment_cut", index=i, available=avail)
+            dbg("segment done", seg=i, available=avail,
+                methods={k: entry[k] for k in ("acam_method", "bcam_method", "ccam_method") if entry[k]},
+                secs=round(time.monotonic() - seg_t, 2))
         except Exception as exc:
             entry["error"] = f"{type(exc).__name__}: {exc}"
             log_status(status="segment_failed", index=i, error=entry["error"])
+            dbg("segment FAILED", seg=i, error=entry["error"])
+        return entry
 
-        manifest["segments"].append(entry)
-        write_manifest_atomic(manifest_path, manifest)
+    workers = args.workers if args.workers and args.workers > 0 else min(4, os.cpu_count() or 2)
+    log_status(status="cutting", cut_method=args.cut_method, workers=workers,
+               segments=len(validated), pad_seconds=PAD_SECONDS)
+    entries_by_index = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_to_index = {ex.submit(process_segment, i, seg): i
+                           for i, seg in enumerate(validated)}
+        for fut in as_completed(future_to_index):
+            i = future_to_index[fut]
+            try:
+                entry = fut.result()
+            except Exception as exc:
+                # process_segment handles its own errors and returns an entry;
+                # this only fires for an unexpected raise. Record it as a failed
+                # segment rather than aborting the whole export (losing every
+                # already-completed clip).
+                entry = {"index": i, "error": f"{type(exc).__name__}: {exc}"}
+                log_status(status="segment_failed", index=i, error=entry["error"])
+            entries_by_index[entry["index"]] = entry
+    manifest["segments"] = [entries_by_index[i] for i in sorted(entries_by_index)]
+    write_manifest_atomic(manifest_path, manifest)
 
     if args.skip_validation:
         log_status(status="validation_skipped")
     else:
+        _ctx.label = "validate"  # tag the validation-phase log lines (main thread)
         tolerance_s = args.tolerance_frames / float(fps)
         validation = {"tolerance_seconds": round(tolerance_s, 4)}
         try:
             with tempfile.TemporaryDirectory(prefix="multicam-validate-") as tmp:
                 has_b = args.bcam is not None
                 has_c = args.ccam is not None
-                all_three = None
-                if has_b and has_c:
-                    all_three = next(
-                        (s for s in manifest["segments"]
-                         if s["acam_clip"] and s["bcam_clip"] and s["ccam_clip"]),
-                        None,
-                    )
-                if all_three:
-                    a_clip = str(outdir / all_three["acam_clip"])
-                    b_lag = measure_clip_lag(a_clip, str(outdir / all_three["bcam_clip"]), tmp)
-                    c_lag = measure_clip_lag(a_clip, str(outdir / all_three["ccam_clip"]), tmp)
-                    passed = abs(b_lag) <= tolerance_s and abs(c_lag) <= tolerance_s
-                    validation.update(
-                        method="all_three", segment_index=all_three["index"],
-                        b_lag_seconds=round(b_lag, 4),
-                        c_lag_seconds=round(c_lag, 4),
-                        passed=passed,
-                    )
+                has_l1 = args.lav1 is not None
+                has_l2 = args.lav2 is not None
+
+                # One representative cut segment per alt source (A present too).
+                b_seg = next((s for s in manifest["segments"]
+                              if s["acam_clip"] and s["bcam_clip"]), None) if has_b else None
+                c_seg = next((s for s in manifest["segments"]
+                              if s["acam_clip"] and s["ccam_clip"]), None) if has_c else None
+                l1_seg = next((s for s in manifest["segments"]
+                               if s["acam_clip"] and s["lav1_clip"]), None) if has_l1 else None
+                l2_seg = next((s for s in manifest["segments"]
+                               if s["acam_clip"] and s["lav2_clip"]), None) if has_l2 else None
+                all_three = next(
+                    (s for s in manifest["segments"]
+                     if s["acam_clip"] and s["bcam_clip"] and s["ccam_clip"]),
+                    None,
+                ) if has_b and has_c else None
+
+                def check(label, seg, clip_key):
+                    """Measure one alt source's lag vs A on its representative
+                    segment; record it and fail validation if out of tolerance."""
+                    lag = measure_clip_lag(str(outdir / seg["acam_clip"]),
+                                           str(outdir / seg[clip_key]), tmp)
+                    validation[f"{label}_segment_index"] = seg["index"]
+                    validation[f"{label}_lag_seconds"] = round(lag, 4)
+                    if abs(lag) > tolerance_s:
+                        validation["passed"] = False
+
+                if not any([b_seg, c_seg, l1_seg, l2_seg]):
+                    validation.update(method="skipped_no_overlap", passed=True)
                 else:
-                    b_seg = next((s for s in manifest["segments"]
-                                  if s["acam_clip"] and s["bcam_clip"]), None) if has_b else None
-                    c_seg = next((s for s in manifest["segments"]
-                                  if s["acam_clip"] and s["ccam_clip"]), None) if has_c else None
-                    has_l1 = args.lav1 is not None
-                    has_l2 = args.lav2 is not None
-                    l1_seg = next((s for s in manifest["segments"]
-                                   if s["acam_clip"] and s["lav1_clip"]), None) if has_l1 else None
-                    l2_seg = next((s for s in manifest["segments"]
-                                   if s["acam_clip"] and s["lav2_clip"]), None) if has_l2 else None
-                    if not b_seg and not c_seg and not l1_seg and not l2_seg:
-                        validation.update(method="skipped_no_overlap", passed=True)
+                    # Prefer reporting B/C against a shared A+B+C segment when one
+                    # exists; lavs are ALWAYS validated regardless of that branch.
+                    validation["passed"] = True
+                    if all_three:
+                        validation["method"] = "all_three"
+                        validation["segment_index"] = all_three["index"]
+                        a_clip = str(outdir / all_three["acam_clip"])
+                        b_lag = measure_clip_lag(a_clip, str(outdir / all_three["bcam_clip"]), tmp)
+                        c_lag = measure_clip_lag(a_clip, str(outdir / all_three["ccam_clip"]), tmp)
+                        validation["b_lag_seconds"] = round(b_lag, 4)
+                        validation["c_lag_seconds"] = round(c_lag, 4)
+                        if abs(b_lag) > tolerance_s or abs(c_lag) > tolerance_s:
+                            validation["passed"] = False
                     else:
-                        validation.update(method="per_cam", passed=True)
+                        validation["method"] = "per_cam"
                         if b_seg:
-                            b_lag = measure_clip_lag(str(outdir / b_seg["acam_clip"]),
-                                                     str(outdir / b_seg["bcam_clip"]), tmp)
-                            validation["b_segment_index"] = b_seg["index"]
-                            validation["b_lag_seconds"] = round(b_lag, 4)
-                            if abs(b_lag) > tolerance_s:
-                                validation["passed"] = False
+                            check("b", b_seg, "bcam_clip")
                         if c_seg:
-                            c_lag = measure_clip_lag(str(outdir / c_seg["acam_clip"]),
-                                                     str(outdir / c_seg["ccam_clip"]), tmp)
-                            validation["c_segment_index"] = c_seg["index"]
-                            validation["c_lag_seconds"] = round(c_lag, 4)
-                            if abs(c_lag) > tolerance_s:
-                                validation["passed"] = False
-                        if l1_seg:
-                            l1_lag = measure_clip_lag(str(outdir / l1_seg["acam_clip"]),
-                                                      str(outdir / l1_seg["lav1_clip"]), tmp)
-                            validation["lav1_segment_index"] = l1_seg["index"]
-                            validation["lav1_lag_seconds"] = round(l1_lag, 4)
-                            if abs(l1_lag) > tolerance_s:
-                                validation["passed"] = False
-                        if l2_seg:
-                            l2_lag = measure_clip_lag(str(outdir / l2_seg["acam_clip"]),
-                                                      str(outdir / l2_seg["lav2_clip"]), tmp)
-                            validation["lav2_segment_index"] = l2_seg["index"]
-                            validation["lav2_lag_seconds"] = round(l2_lag, 4)
-                            if abs(l2_lag) > tolerance_s:
-                                validation["passed"] = False
+                            check("c", c_seg, "ccam_clip")
+                    if l1_seg:
+                        check("lav1", l1_seg, "lav1_clip")
+                    if l2_seg:
+                        check("lav2", l2_seg, "lav2_clip")
         except Exception as exc:
             validation["error"] = f"{type(exc).__name__}: {exc}"
             log_status(status="validation_error", error=validation["error"])

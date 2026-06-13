@@ -347,7 +347,7 @@ export default function VideoEditor({ words, onChange, onContinue, videoSrc, fil
           >
             ↓ Debug TXT
           </Button>
-          <Button onClick={onContinue} className="bg-violet-600 text-white hover:bg-violet-500 font-semibold">
+          <Button onClick={onContinue} className="bg-amber-600 text-white hover:bg-amber-500 font-semibold">
             Export →
           </Button>
         </div>
@@ -367,7 +367,7 @@ export default function VideoEditor({ words, onChange, onContinue, videoSrc, fil
             />
             <button
               onClick={() => playCurrentSegment()}
-              className="w-full py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-semibold transition-colors"
+              className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-sm font-semibold transition-colors"
             >
               ▶ Play Clip
             </button>
@@ -438,7 +438,7 @@ export default function VideoEditor({ words, onChange, onContinue, videoSrc, fil
                                   ? "bg-red-500/20 text-neutral-400"
                                   : "text-neutral-400"
                                 : isSelected
-                                  ? "bg-violet-500/30 text-white"
+                                  ? "bg-amber-500/30 text-white"
                                   : "text-green-300 hover:bg-green-500/10"
                               }
                             `}

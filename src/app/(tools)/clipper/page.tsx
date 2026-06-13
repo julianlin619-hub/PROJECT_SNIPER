@@ -52,50 +52,8 @@ export default function Home() {
   };
 
 
-  const stepLabels: { key: AppStep; label: string }[] = [
-    { key: "browse", label: "1. Transcribe" },
-    { key: "prompt", label: "2. Clip" },
-    { key: "edit", label: "3. Edit" },
-    { key: "export", label: "4. Export" },
-  ];
-
-  const stepOrder = stepLabels.map((s) => s.key);
-  const currentIdx = stepOrder.indexOf(step);
-
   return (
-    <main className="min-h-screen bg-neutral-950 text-white">
-      {/* Top bar */}
-      <div className="border-b border-neutral-800 px-6 py-4">
-        <div className="max-w-5xl mx-auto flex items-center gap-4">
-          <span className="text-lg font-bold tracking-tight">✂️ CLIPPER</span>
-          <div className="flex items-center gap-1.5 ml-4">
-            {stepLabels.map((s, i) => (
-              <div key={s.key} className="flex items-center gap-1.5">
-                <button
-                  onClick={() => {
-                    const targetIdx = stepOrder.indexOf(s.key);
-                    if (targetIdx <= currentIdx) setStep(s.key);
-                  }}
-                  disabled={stepOrder.indexOf(s.key) > currentIdx}
-                  className={`text-xs px-3 py-1.5 rounded-full transition-colors ${
-                    step === s.key
-                      ? "bg-violet-600 text-white font-medium"
-                      : stepOrder.indexOf(s.key) < currentIdx
-                      ? "text-neutral-400 hover:text-neutral-200 cursor-pointer"
-                      : "text-neutral-700 cursor-not-allowed"
-                  }`}
-                >
-                  {s.label}
-                </button>
-                {i < stepLabels.length - 1 && (
-                  <span className="text-neutral-800">→</span>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
+    <main className="reticle-field grain min-h-screen bg-background text-foreground">
       {/* Content */}
       <div className="max-w-5xl mx-auto px-6 py-8">
         {step === "browse" && (

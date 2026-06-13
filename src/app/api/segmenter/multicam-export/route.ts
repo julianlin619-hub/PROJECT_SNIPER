@@ -127,6 +127,8 @@ export async function POST(req: NextRequest) {
   };
 
   const encoder = new TextEncoder();
+  let proc: ReturnType<typeof spawn> | null = null;
+  let keepalive: ReturnType<typeof setInterval> | null = null;
   const stream = new ReadableStream({
     start(controller) {
       const send = (obj: unknown) => {
@@ -135,16 +137,17 @@ export async function POST(req: NextRequest) {
         } catch {}
       };
 
-      const proc = spawn(pythonInterpreter(), args, { env: { ...process.env } });
+      const child = spawn(pythonInterpreter(), args, { env: { ...process.env } });
+      proc = child;
 
       let stderrBuffer = "";
       let stdoutBuffer = "";
 
-      const keepalive = setInterval(() => {
+      keepalive = setInterval(() => {
         try { controller.enqueue(encoder.encode(`: keepalive\n\n`)); } catch {}
       }, 10000);
 
-      proc.stdout.on("data", (data: Buffer) => {
+      child.stdout.on("data", (data: Buffer) => {
         stdoutBuffer += data.toString();
         const parts = stdoutBuffer.split("\n");
         stdoutBuffer = parts.pop() ?? "";
@@ -155,15 +158,15 @@ export async function POST(req: NextRequest) {
         }
       });
 
-      proc.stderr.on("data", (data: Buffer) => {
+      child.stderr.on("data", (data: Buffer) => {
         const text = data.toString();
         stderrBuffer += text;
         process.stderr.write(`[multicam_pipeline.py stderr] ${text}`);
         send({ stderr: text.trim() });
       });
 
-      proc.on("close", (code) => {
-        clearInterval(keepalive);
+      child.on("close", (code) => {
+        if (keepalive) clearInterval(keepalive);
         if (stdoutBuffer.trim()) {
           controller.enqueue(encoder.encode(`data: ${stdoutBuffer}\n\n`));
           stdoutBuffer = "";
@@ -184,12 +187,22 @@ export async function POST(req: NextRequest) {
         controller.close();
       });
 
-      proc.on("error", (err) => {
-        clearInterval(keepalive);
+      child.on("error", (err) => {
+        if (keepalive) clearInterval(keepalive);
         send({ error: err.message });
         cleanup();
         controller.close();
       });
+    },
+    // Client disconnected (navigated away / aborted). Kill the render so it
+    // doesn't keep burning CPU, and clean up the temp dir + any partial zip.
+    cancel() {
+      if (keepalive) clearInterval(keepalive);
+      if (proc) { try { proc.kill("SIGTERM"); } catch {} }
+      if (existsSync(zipPath)) {
+        try { rmSync(zipPath, { force: true }); } catch {}
+      }
+      cleanup();
     },
   });
 

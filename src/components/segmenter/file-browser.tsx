@@ -217,8 +217,7 @@ export default function FileBrowser({ onComplete }: Props) {
       {phase === "browse" && (
         <>
           <div className="mb-6">
-            <h2 className="text-2xl font-bold mb-1">Select File</h2>
-            <p className="text-neutral-400 text-sm">Click a slot below to browse your folders and pick a file. Files stay on your machine.</p>
+            <h2 className="text-2xl font-bold">Select File</h2>
           </div>
 
           {/* Camera slots: click a slot to open the native macOS file picker. */}
