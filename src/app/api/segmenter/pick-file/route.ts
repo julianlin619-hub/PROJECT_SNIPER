@@ -25,20 +25,34 @@ export async function POST(req: Request) {
   }
 
   let prompt = "Choose a file";
-  let kind: "video" | "audio" = "video";
+  let kind: "video" | "audio" | "any" = "video";
+  let multiple = false;
   try {
     const body = await req.json();
     if (typeof body?.prompt === "string") prompt = body.prompt;
     if (body?.kind === "audio") kind = "audio";
+    else if (body?.kind === "any") kind = "any";
+    if (body?.multiple === true) multiple = true;
   } catch { /* empty body is fine */ }
 
   const safePrompt = prompt.replace(/["\\]/g, "\\$&");
   // public.audio is the parent UTI; covers wav/mp3/m4a/aac/flac/ogg/opus.
-  const utis = kind === "audio"
-    ? `{"public.audio"}`
-    : `{"public.movie", "public.mpeg-4", "com.apple.quicktime-movie"}`;
-  const script =
-    `POSIX path of (choose file with prompt "${safePrompt}" of type ${utis})`;
+  const VIDEO_UTIS = `"public.movie", "public.mpeg-4", "com.apple.quicktime-movie"`;
+  const utis =
+    kind === "audio" ? `{"public.audio"}`
+    : kind === "any" ? `{${VIDEO_UTIS}, "public.audio"}`
+    : `{${VIDEO_UTIS}}`;
+
+  // For multi-select, AppleScript returns a list of file references, so we loop
+  // and emit one POSIX path per line. Single-select returns one path directly.
+  const script = multiple
+    ? `set theFiles to choose file with prompt "${safePrompt}" of type ${utis} with multiple selections allowed
+set out to ""
+repeat with f in theFiles
+  set out to out & POSIX path of f & linefeed
+end repeat
+return out`
+    : `POSIX path of (choose file with prompt "${safePrompt}" of type ${utis})`;
 
   const { stdout, stderr, code } = await runOsascript(script);
 
@@ -51,6 +65,16 @@ export async function POST(req: Request) {
       { error: stderr.trim() || "Picker failed" },
       { status: 500 },
     );
+  }
+
+  if (multiple) {
+    const files = stdout
+      .split("\n")
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map((p) => ({ path: p, name: p.split("/").pop() || p }));
+    if (files.length === 0) return NextResponse.json({ canceled: true });
+    return NextResponse.json({ files });
   }
 
   const filePath = stdout.trim();

@@ -29,7 +29,10 @@ interface SegmentResult {
 }
 
 export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPath, lav1Path, lav2Path }: Props) {
-  const [includeFiller, setIncludeFiller] = useState(false);
+  // Which clips the user has ticked for export. Defaults to every non-filler clip.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(
+    () => new Set(segments.filter((s) => !isFiller(s.title)).map((s) => s.id)),
+  );
 
   const [mcLoading, setMcLoading] = useState(false);
   const [mcError, setMcError] = useState<string | null>(null);
@@ -41,7 +44,17 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
   const [mcSegResults, setMcSegResults] = useState<SegmentResult[]>([]);
   const [mcValidation, setMcValidation] = useState<string | null>(null);
 
-  const exportable = includeFiller ? segments : segments.filter((s) => !isFiller(s.title));
+  const exportable = segments.filter((s) => selectedIds.has(s.id));
+
+  const toggleSegment = (id: number) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const selectAll = () => setSelectedIds(new Set(segments.map((s) => s.id)));
+  const selectNone = () => setSelectedIds(new Set());
 
   const hasB = !!bcamPath;
   const hasC = !!ccamPath;
@@ -172,7 +185,7 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
     }
   };
 
-  const fillerCount = segments.filter((s) => isFiller(s.title)).length;
+  const allSelected = selectedIds.size === segments.length && segments.length > 0;
 
   return (
     <div className="max-w-2xl mx-auto">
@@ -188,29 +201,46 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
 
       <div className="mb-8 rounded-xl border border-neutral-800 bg-neutral-900/30 overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-neutral-800">
-          <span className="text-xs text-neutral-500 uppercase tracking-wider font-medium">Segments</span>
-          {fillerCount > 0 && (
-            <label className="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={includeFiller}
-                onChange={(e) => setIncludeFiller(e.target.checked)}
-                className="accent-cyan-500"
-              />
-              Include {fillerCount} filler clip{fillerCount !== 1 ? "s" : ""}
-            </label>
-          )}
+          <span className="text-xs text-neutral-500 uppercase tracking-wider font-medium">
+            Segments
+            <span className="ml-2 text-neutral-600 normal-case tracking-normal">
+              {selectedIds.size} of {segments.length} selected
+            </span>
+          </span>
+          <div className="flex items-center gap-3 text-xs">
+            <button
+              onClick={selectAll}
+              disabled={allSelected}
+              className="text-neutral-400 hover:text-cyan-300 disabled:opacity-30 disabled:cursor-default transition-colors"
+            >
+              Select all
+            </button>
+            <span className="text-neutral-700">·</span>
+            <button
+              onClick={selectNone}
+              disabled={selectedIds.size === 0}
+              className="text-neutral-400 hover:text-cyan-300 disabled:opacity-30 disabled:cursor-default transition-colors"
+            >
+              Clear
+            </button>
+          </div>
         </div>
         <div className="divide-y divide-neutral-800">
           {segments.map((seg, i) => {
             const filler = isFiller(seg.title);
-            const willExport = includeFiller || !filler;
+            const willExport = selectedIds.has(seg.id);
             return (
-              <div
+              <label
                 key={seg.id}
-                className={`flex items-center justify-between px-4 py-1.5 ${willExport ? "" : "opacity-40"}`}
+                className={`flex items-center justify-between px-4 py-1.5 cursor-pointer hover:bg-neutral-800/30 transition-colors ${willExport ? "" : "opacity-40"}`}
               >
                 <div className="flex items-center gap-3 min-w-0">
+                  <input
+                    type="checkbox"
+                    checked={willExport}
+                    onChange={() => toggleSegment(seg.id)}
+                    className="accent-cyan-500 shrink-0"
+                  />
                   <span className="text-xs text-neutral-600 font-mono w-5 text-right shrink-0">{i + 1}</span>
                   <span className={`text-xs truncate ${filler ? "text-neutral-500 italic" : "text-neutral-200"}`}>
                     {seg.title}
@@ -220,7 +250,7 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
                   {fmtTime(seg.start)} → {fmtTime(seg.end)}
                   <span className="text-neutral-700 ml-2">({Math.round(seg.end - seg.start)}s)</span>
                 </span>
-              </div>
+              </label>
             );
           })}
         </div>

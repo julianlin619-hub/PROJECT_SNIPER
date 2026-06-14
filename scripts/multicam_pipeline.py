@@ -776,6 +776,94 @@ def cut_audio_segment_window(src, lo, hi, src_dur, out):
     return (head_pad, tail_pad)
 
 
+# ---------- per-segment audio drift correction ----------
+
+# Minimum normalized-correlation peak (0..1) for a per-segment offset to be
+# trusted. A real A<->lav alignment produces a sharp, prominent peak; silence,
+# non-matching audio, or a true match sitting outside the search window produce
+# a weak/flat one. Below this we keep the reliable global offset rather than
+# risk pushing a good track out of sync.
+AUDIO_DRIFT_MIN_CONFIDENCE = 0.10
+
+
+def _ncc_best_lag(ref, probe):
+    """Best lag (in samples) of `probe` within `ref` and its normalized
+    correlation peak (0..1). Uses 'valid' cross-correlation (probe fully inside
+    ref), normalized per-lag by the windowed L2 norms so the peak is a true
+    similarity score, not just a raw magnitude that scales with loudness."""
+    ref = ref.astype(np.float64) - float(ref.mean())
+    probe = probe.astype(np.float64) - float(probe.mean())
+    corr = fftconvolve(ref, probe[::-1], mode="valid")
+    P = len(probe)
+    # Sliding L2 norm of ref over each length-P window, via a cumulative sum of
+    # squares (cheap, no per-lag loop).
+    csum = np.concatenate(([0.0], np.cumsum(ref * ref)))
+    ks = np.arange(len(corr))
+    win_norm = np.sqrt(np.maximum(csum[ks + P] - csum[ks], 1e-12))
+    probe_norm = np.sqrt(max(float(np.dot(probe, probe)), 1e-12))
+    ncc = corr / (win_norm * probe_norm)
+    idx = int(np.argmax(ncc))
+    return idx, float(ncc[idx])
+
+
+def refine_audio_offset(name, a_path, lav_path, a_dur, lav_dur, global_offset,
+                        a_center, probe_dur, search_pad, sr):
+    """Re-measure the A->lav sync offset *locally* around a_center (a time on
+    A's timeline), seeded by global_offset, to correct clock drift between the
+    camera and a separate audio recorder.
+
+    A single global offset is exact only where it was measured; a recorder whose
+    clock runs slightly fast/slow slides out of sync across a long take. Here we
+    pull a short probe from the lav around this segment and cross-correlate it
+    against a slightly wider A window, so the returned offset reflects the drift
+    *at this segment* instead of the whole-show average.
+
+    Returns a refined offset (seconds), or None if the region can't be reliably
+    probed — too short, the peak hard against a search-window edge (true match
+    likely outside the window), or a weak correlation (silence / non-matching
+    audio). In every None case the caller keeps the global offset. Self-contained
+    — creates and cleans its own temp dir, so it is safe to call concurrently
+    from the per-segment worker threads.
+    """
+    pd = min(probe_dur, max(0.0, lav_dur - 1.0), max(0.0, a_dur - 1.0))
+    if pd <= 1.0:
+        return None
+    # Where this segment lives in the lav file, per the global offset.
+    lav_center = a_center - global_offset
+    lav_probe_start = max(0.0, min(lav_dur - pd, lav_center - pd / 2.0))
+    # Search a wider A window centred on the expected match so residual drift
+    # (a few hundred ms over a long take) lands comfortably inside it.
+    expected_a_start = lav_probe_start + global_offset
+    a_win_dur = min(a_dur, pd + 2.0 * search_pad)
+    if a_win_dur <= pd:
+        return None
+    a_win_start = max(0.0, min(a_dur - a_win_dur, expected_a_start - search_pad))
+    with tempfile.TemporaryDirectory(prefix="drift-") as tmp_dir:
+        a_wav = os.path.join(tmp_dir, "a.wav")
+        l_wav = os.path.join(tmp_dir, "l.wav")
+        extract_audio_window(a_path, a_win_start, a_win_dur, a_wav, sr=sr)
+        extract_audio_window(lav_path, lav_probe_start, pd, l_wav, sr=sr)
+        a_sig, sr_a = load_wav_mono(a_wav)
+        l_sig, _ = load_wav_mono(l_wav)
+        if len(l_sig) == 0 or len(a_sig) < len(l_sig):
+            return None
+        lag_samples, confidence = _ncc_best_lag(a_sig, l_sig)
+        lag_in_window = lag_samples / float(sr_a)
+    # Weak correlation → distrust (silence / mismatched audio / no real match).
+    if confidence < AUDIO_DRIFT_MIN_CONFIDENCE:
+        dbg(f"{name} drift refine: weak match, keep global",
+            confidence=round(confidence, 3))
+        return None
+    # A peak hard against either edge means the true match is probably outside
+    # the search window — distrust it and keep the global offset.
+    edge_margin = 0.1
+    if lag_in_window < edge_margin or lag_in_window > (a_win_dur - pd) - edge_margin:
+        dbg(f"{name} drift refine: peak at window edge, keep global",
+            lag=round(lag_in_window, 3))
+        return None
+    return (a_win_start + lag_in_window) - lav_probe_start
+
+
 # ---------- validation ----------
 
 def measure_clip_lag(ref_clip, alt_clip, tmp_dir, probe_dur=10.0):
@@ -872,6 +960,17 @@ def parse_args():
                         "automatically when a smartcut seam fails validation.")
     p.add_argument("--workers", type=int, default=None,
                    help="Parallel segment workers. Default min(4, cpu_count).")
+    p.add_argument("--audio-drift-correction", action=argparse.BooleanOptionalAction, default=True,
+                   help="Re-measure each lav's sync offset per segment to correct "
+                        "clock drift between the camera and a separate audio recorder "
+                        "(default on). Use --no-audio-drift-correction to fall back to "
+                        "one global offset for the whole recording.")
+    p.add_argument("--audio-drift-window", type=float, default=2.0,
+                   help="Plus/minus seconds of drift searched for around each segment "
+                        "when refining a lav offset (default 2.0).")
+    p.add_argument("--audio-drift-probe", type=float, default=15.0,
+                   help="Audio probe length (s) used for per-segment lav offset "
+                        "refinement (default 15.0).")
     p.add_argument("--skip-validation", action="store_true")
     p.add_argument("--zip-out", default=None,
                    help="If set, bundle the outdir into a ZIP at this path after success.")
@@ -1102,21 +1201,44 @@ def main():
 
             # AUDIO sources adapt to that window: a small shortfall is filled
             # with silence (real samples stay put); only a large gap drops it.
+            # Each lav's offset is first re-measured *for this segment* so clock
+            # drift is corrected before we decide the window. audio_included
+            # holds (candidate, segment_offset) — the offset actually cut with.
+            a_center = (a_start + a_end) / 2.0
             audio_included = []
             for c in audio:
-                name, offset, src_dur = c[0], c[3], c[4]
-                short = max(0.0, offset - a_lo) + max(0.0, (a_hi - offset) - src_dur)
+                name, src, offset, src_dur = c[0], c[2], c[3], c[4]
+                seg_offset = offset
+                if args.audio_drift_correction:
+                    try:
+                        refined = refine_audio_offset(
+                            name, args.acam, src, a_dur, src_dur, offset, a_center,
+                            args.audio_drift_probe, args.audio_drift_window, args.fine_sr)
+                    except Exception as exc:
+                        refined = None
+                        dbg(f"{name} drift refine error -> keep global offset",
+                            error=f"{type(exc).__name__}: {exc}")
+                    if refined is not None:
+                        drift = refined - offset
+                        if abs(drift) > 1e-4:
+                            log_status(status="audio_drift_corrected", index=i, source=name,
+                                       global_offset=round(offset, 4),
+                                       segment_offset=round(refined, 4), drift=round(drift, 4))
+                            dbg(f"{name} drift corrected", global_off=round(offset, 4),
+                                seg_off=round(refined, 4), drift=round(drift, 4))
+                        seg_offset = refined
+                short = max(0.0, seg_offset - a_lo) + max(0.0, (a_hi - seg_offset) - src_dur)
                 if short > AUDIO_SILENCE_PAD_MAX:
                     log_status(status="source_dropped", index=i, source=name,
                                reason=f"audio short by {short:.3f}s (> {AUDIO_SILENCE_PAD_MAX}s)")
                     dbg(f"{name} DROP: audio short by {short:.3f}s")
                     continue
-                audio_included.append(c)
+                audio_included.append((c, seg_offset))
 
             dbg("segment start", title=entry["title"],
                 core=f"[{a_start:.3f},{a_end:.3f}]", padded=f"[{a_lo:.3f},{a_hi:.3f}]",
                 pre=round(pre, 3), post=round(post, 3),
-                included=[c[0] for c in video_included + audio_included])
+                included=[c[0] for c in video_included] + [c[0] for c, _ in audio_included])
             if pre < PAD_SECONDS - 1e-3 or post < PAD_SECONDS - 1e-3:
                 log_status(status="padding_reduced", index=i,
                            pre=round(pre, 3), post=round(post, 3),
@@ -1135,9 +1257,10 @@ def main():
                 entry[clip_key.replace("_clip", "_available")] = True
                 avail.append(name)
 
-            for name, kind, src, offset, src_dur, out_path, clip_key, method_key in audio_included:
-                lo = a_lo - offset
-                hi = a_hi - offset
+            for c, seg_offset in audio_included:
+                name, kind, src, _global_offset, src_dur, out_path, clip_key, method_key = c
+                lo = a_lo - seg_offset
+                hi = a_hi - seg_offset
                 with log_context(f"seg{i}/{name}"):
                     head_pad, tail_pad = cut_audio_segment_window(src, lo, hi, src_dur, str(out_path))
                     if head_pad > 1e-6 or tail_pad > 1e-6:

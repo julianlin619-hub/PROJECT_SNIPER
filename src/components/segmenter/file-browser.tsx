@@ -19,6 +19,46 @@ interface Props {
 
 type SlotKey = "a" | "b" | "c" | "lav1" | "lav2";
 
+type PickedFile = { path: string; name: string };
+
+const VIDEO_EXT = /\.(mp4|mov|m4v|avi|mkv|mpg|mpeg|webm|wmv|flv)$/i;
+const AUDIO_EXT = /\.(wav|mp3|m4a|aac|flac|ogg|opus|aif|aiff|caf|wma)$/i;
+
+// Rank a video filename so an obvious master / A-cam lands in slot A, a B-cam in
+// slot B, etc. Files with no hint keep their picked order (slotted into whatever
+// camera slots remain). Lower score = earlier slot.
+function camHintScore(name: string): number {
+  const n = name.toLowerCase();
+  if (/master|\ba[\s_-]?cam\b|\bcam[\s_-]?a\b|\bacam\b/.test(n)) return 0;
+  if (/\bb[\s_-]?cam\b|\bcam[\s_-]?b\b|\bbcam\b/.test(n)) return 1;
+  if (/\bc[\s_-]?cam\b|\bcam[\s_-]?c\b|\bccam\b/.test(n)) return 2;
+  return 1.5;
+}
+
+// Split a batch of picked files into camera slots (A/B/C) and lav slots (1/2)
+// by file type, refined by filename hints. Anything that doesn't fit (wrong
+// type or more files than slots) is returned as leftovers so the UI can report it.
+function autoAssign(files: PickedFile[]): {
+  assigned: Partial<Record<SlotKey, PickedFile>>;
+  leftovers: PickedFile[];
+} {
+  const videos = files.filter((f) => VIDEO_EXT.test(f.name));
+  const audios = files.filter((f) => AUDIO_EXT.test(f.name));
+  const unknown = files.filter((f) => !VIDEO_EXT.test(f.name) && !AUDIO_EXT.test(f.name));
+
+  videos.sort((a, b) => camHintScore(a.name) - camHintScore(b.name) || a.name.localeCompare(b.name));
+  audios.sort((a, b) => a.name.localeCompare(b.name));
+
+  const assigned: Partial<Record<SlotKey, PickedFile>> = {};
+  const camSlots: SlotKey[] = ["a", "b", "c"];
+  const lavSlots: SlotKey[] = ["lav1", "lav2"];
+  videos.slice(0, 3).forEach((f, i) => (assigned[camSlots[i]] = f));
+  audios.slice(0, 2).forEach((f, i) => (assigned[lavSlots[i]] = f));
+
+  const leftovers = [...videos.slice(3), ...audios.slice(2), ...unknown];
+  return { assigned, leftovers };
+}
+
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -62,6 +102,9 @@ export default function FileBrowser({ onComplete }: Props) {
   const [pickingSlot, setPickingSlot] = useState<SlotKey | null>(null);
   const [pickError, setPickError] = useState<string | null>(null);
 
+  const [pickingMulti, setPickingMulti] = useState(false);
+  const [autoNotice, setAutoNotice] = useState<string | null>(null);
+
   const [phase, setPhase] = useState<Phase>("browse");
 
   const [txStatus, setTxStatus] = useState<TxStatus>("extracting_audio");
@@ -101,6 +144,61 @@ export default function FileBrowser({ onComplete }: Props) {
       setPickError(e instanceof Error ? e.message : "Picker failed");
     } finally {
       setPickingSlot(null);
+    }
+  };
+
+  // Write a single picked file into the given slot's state.
+  const applyToSlot = (slot: SlotKey, file: PickedFile) => {
+    if (slot === "a") { setVideoPath(file.path); setVideoName(file.name); }
+    else if (slot === "b") { setBcamPath(file.path); setBcamName(file.name); }
+    else if (slot === "c") { setCcamPath(file.path); setCcamName(file.name); }
+    else if (slot === "lav1") { setLav1Path(file.path); setLav1Name(file.name); }
+    else { setLav2Path(file.path); setLav2Name(file.name); }
+  };
+
+  // Open the native picker in multi-select mode, then auto-route every chosen
+  // file into a camera or audio slot.
+  const pickMultiple = async () => {
+    if (pickingSlot || pickingMulti) return;
+    setPickingMulti(true);
+    setPickError(null);
+    setAutoNotice(null);
+    try {
+      const res = await fetch("/api/segmenter/pick-file", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "Select all clips — cameras and audio together",
+          kind: "any",
+          multiple: true,
+        }),
+      });
+      const data = await res.json();
+      if (data.canceled) return;
+      if (data.error) { setPickError(data.error); return; }
+      const files: PickedFile[] = data.files ?? [];
+      if (files.length === 0) return;
+
+      const { assigned, leftovers } = autoAssign(files);
+      const order: SlotKey[] = ["a", "b", "c", "lav1", "lav2"];
+      for (const slot of order) {
+        const f = assigned[slot];
+        if (f) applyToSlot(slot, f);
+      }
+
+      const placed = order
+        .filter((s) => assigned[s])
+        .map((s) => SLOT_LABELS[s])
+        .join(", ");
+      let notice = placed ? `Auto-sorted: ${placed}.` : "No camera or audio files recognized.";
+      if (leftovers.length > 0) {
+        notice += ` ${leftovers.length} file${leftovers.length !== 1 ? "s" : ""} didn't fit (only 3 cameras + 2 lavs): ${leftovers.map((f) => f.name).join(", ")}.`;
+      }
+      setAutoNotice(notice);
+    } catch (e: unknown) {
+      setPickError(e instanceof Error ? e.message : "Picker failed");
+    } finally {
+      setPickingMulti(false);
     }
   };
 
@@ -216,9 +314,35 @@ export default function FileBrowser({ onComplete }: Props) {
       {/* ── BROWSE PHASE ── */}
       {phase === "browse" && (
         <>
-          <div className="mb-6">
+          <div className="mb-4">
             <h2 className="text-2xl font-bold">Select File</h2>
           </div>
+
+          {/* Bulk add: pick all clips at once; the app auto-sorts them into
+              camera (video) and lav (audio) slots by file type + name hints. */}
+          <button
+            onClick={pickMultiple}
+            disabled={!!pickingSlot || pickingMulti}
+            className="w-full mb-3 rounded-lg border-2 border-dashed border-cyan-700/60 bg-cyan-950/10 hover:border-cyan-500 hover:bg-cyan-950/25 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-3 text-left transition-colors group"
+          >
+            <div className="flex items-center gap-3">
+              <span className="text-base shrink-0">{pickingMulti ? "⏳" : "✨"}</span>
+              <div className="flex flex-col min-w-0 flex-1">
+                <span className="text-sm font-semibold text-cyan-200">
+                  {pickingMulti ? "Picker open…" : "Add clips — auto-sort"}
+                </span>
+                <span className="text-[11px] text-cyan-400/70">
+                  Select cameras + audio together; they fill the slots below automatically
+                </span>
+              </div>
+            </div>
+          </button>
+
+          {autoNotice && (
+            <div className="mb-3 text-[11px] text-neutral-400 p-2.5 bg-neutral-900/40 border border-neutral-800 rounded-lg">
+              {autoNotice}
+            </div>
+          )}
 
           {/* Camera slots: click a slot to open the native macOS file picker. */}
           <div className="mb-6 space-y-2">
@@ -240,7 +364,7 @@ export default function FileBrowser({ onComplete }: Props) {
                 <button
                   key={slot.key}
                   onClick={() => pickFileFor(slot.key)}
-                  disabled={!!pickingSlot && !isPicking}
+                  disabled={pickingMulti || (!!pickingSlot && !isPicking)}
                   className={`w-full text-left rounded-lg border-2 px-3 py-2 transition-colors disabled:opacity-50 ${borderClass}`}
                 >
                   <div className="flex items-center gap-3">
