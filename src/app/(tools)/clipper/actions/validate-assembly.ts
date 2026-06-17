@@ -1,6 +1,7 @@
 "use server";
 
 import Anthropic from "@anthropic-ai/sdk";
+import { dlog } from "@/lib/debug";
 
 const MODEL = "claude-sonnet-4-6";
 const CHUNK_SIZE = 50; // max clips per LLM call
@@ -205,6 +206,8 @@ export async function validateAssembledOutput(
 ): Promise<ValidationResult> {
   if (clips.length === 0) return { removeClips: [], flagClips: [] };
 
+  dlog("clipper:validate", "validate assembled output", { model: MODEL, clips: clips.length });
+
   try {
     const anthropic = new Anthropic();
     const allRemove: number[] = [];
@@ -243,8 +246,10 @@ export async function validateAssembledOutput(
       );
     }
 
+    dlog("clipper:validate", "result", { autoRemove: removeSet, flag: flagSet });
     return { removeClips: removeSet, flagClips: flagSet };
   } catch (err) {
+    dlog("clipper:validate", "failed (skipping)", String(err));
     console.warn("Assembly coherence validation failed (skipping):", err);
     return { removeClips: [], flagClips: [] };
   }

@@ -5,6 +5,7 @@ import path from "path";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
 import { spawnPython, SCRIPTS_DIR } from "../../_lib/spawn-python";
+import { dlog } from "@/lib/debug";
 
 export const runtime = "nodejs";
 export const maxDuration = 600;
@@ -36,7 +37,14 @@ export async function POST(req: NextRequest) {
 
   const outputPath = path.join(tmpdir(), `clipper-export-${randomUUID()}.zip`);
 
+  dlog("segmenter:export", "incoming request", {
+    filePath,
+    segments: (segments as ExportSegment[]).length,
+    outputPath,
+  });
+
   try {
+    dlog("segmenter:export", "spawn export_mp4.py", { script: SCRIPT, filePath, outputPath });
     await spawnPython(SCRIPT, [filePath, JSON.stringify(segments as ExportSegment[]), outputPath]);
 
     if (!existsSync(outputPath)) {
@@ -44,6 +52,7 @@ export async function POST(req: NextRequest) {
     }
 
     const size = statSync(outputPath).size;
+    dlog("segmenter:export", "export complete", { outputPath, sizeBytes: size });
     const nodeStream = createReadStream(outputPath);
     nodeStream.on("close", () => {
       try { unlinkSync(outputPath); } catch {}
@@ -58,6 +67,7 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (e) {
+    dlog("segmenter:export", "export error", e instanceof Error ? e.message : String(e));
     if (existsSync(outputPath)) {
       try { unlinkSync(outputPath); } catch {}
     }

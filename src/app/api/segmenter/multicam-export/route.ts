@@ -6,6 +6,7 @@ import { tmpdir } from "os";
 import { randomUUID } from "crypto";
 import { pythonInterpreter, SCRIPTS_DIR } from "../../_lib/spawn-python";
 import { register } from "../../_lib/multicam-store";
+import { dlog } from "@/lib/debug";
 
 export const runtime = "nodejs";
 export const maxDuration = 3600;
@@ -110,6 +111,17 @@ export async function POST(req: NextRequest) {
 
   const baseFilename = `${basename(acamPath)}_multicam.zip`;
 
+  dlog("segmenter:multicam", "incoming request", {
+    acamPath,
+    bcamPath: hasB ? bcamPath : undefined,
+    ccamPath: hasC ? ccamPath : undefined,
+    lav1Path: hasLav1 ? lav1Path : undefined,
+    lav2Path: hasLav2 ? lav2Path : undefined,
+    segments: exportSegments.length,
+    runId,
+    baseFilename,
+  });
+
   const args = [
     SCRIPT_PATH,
     "--acam", acamPath,
@@ -137,6 +149,7 @@ export async function POST(req: NextRequest) {
         } catch {}
       };
 
+      dlog("segmenter:multicam", "spawn multicam_pipeline.py", { interpreter: pythonInterpreter(), args });
       const child = spawn(pythonInterpreter(), args, { env: { ...process.env } });
       proc = child;
 
@@ -174,8 +187,10 @@ export async function POST(req: NextRequest) {
         console.log(`[multicam_pipeline.py] exited with code ${code}`);
         if (code === 0 && existsSync(zipPath)) {
           const downloadId = register(zipPath, baseFilename);
+          dlog("segmenter:multicam", "pipeline finished, zip registered", { code, downloadId, filename: baseFilename, zipPath });
           send({ status: "ready", downloadId, filename: baseFilename });
         } else {
+          dlog("segmenter:multicam", "pipeline failed", { code });
           send({
             error: `Pipeline exited with code ${code}. ${stderrBuffer.slice(-500)}`,
           });
@@ -189,6 +204,7 @@ export async function POST(req: NextRequest) {
 
       child.on("error", (err) => {
         if (keepalive) clearInterval(keepalive);
+        dlog("segmenter:multicam", "spawn error", err.message);
         send({ error: err.message });
         cleanup();
         controller.close();
@@ -197,6 +213,7 @@ export async function POST(req: NextRequest) {
     // Client disconnected (navigated away / aborted). Kill the render so it
     // doesn't keep burning CPU, and clean up the temp dir + any partial zip.
     cancel() {
+      dlog("segmenter:multicam", "client disconnected, killing pipeline", { runId });
       if (keepalive) clearInterval(keepalive);
       if (proc) { try { proc.kill("SIGTERM"); } catch {} }
       if (existsSync(zipPath)) {

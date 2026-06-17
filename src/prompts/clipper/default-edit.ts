@@ -14,6 +14,20 @@ Given a raw conversation transcript with numbered utterances, produce per-uttera
 You may only KEEP, REMOVE, or TRIM existing text — never add new words, fabricate, or rearrange the order of the transcript.
 </task>
 
+<mic_bleed_duplicates>
+The two speakers were recorded on separate mics that pick up each other, so the SAME
+speech is often transcribed TWICE — once on each speaker, at nearly the same timestamp.
+You'll see the same content appear as two nearby utterances, usually attributed to
+different speakers, and one copy is typically fragmented or garbled (e.g. "[12] Host:
+Husband have been the entire" alongside "[24] Guest: I and my husband have been the
+entire marketing everything.").
+
+When you see such a duplicate pair, KEEP the more complete/coherent copy and REMOVE the
+other. Do NOT trust the speaker label on these — the cleaner, fuller version is the real
+one regardless of which speaker it's tagged to. Never keep both copies of the same
+content.
+</mic_bleed_duplicates>
+
 <word_budget>
 Aim for 300 to 400 words of kept/trimmed content in the final output.
 </word_budget>

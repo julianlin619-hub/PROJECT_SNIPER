@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { TranscriptEntry, SegmentGroup } from "@/lib/types";
+import { dlog } from "@/lib/debug";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 
@@ -103,6 +104,7 @@ export default function TranscriptSegmentEditor({ transcript, segments, onChange
     updated[segIdx] = { ...oldSeg, endLine: lineIdx - 1, end: transcript[lineIdx - 1].end };
     updated.splice(segIdx + 1, 0, newSeg);
     updated.forEach((s, i) => (s.id = i + 1));
+    dlog("segmenter:edit", "split segment", { atLine: lineIdx, segments: updated.length });
     onChange(updated);
   };
 
@@ -116,6 +118,7 @@ export default function TranscriptSegmentEditor({ transcript, segments, onChange
     };
     updated.splice(segIdx, 1);
     updated.forEach((s, i) => (s.id = i + 1));
+    dlog("segmenter:edit", "merge segment", { mergedIdx: segIdx, segments: updated.length });
     onChange(updated);
   };
 
@@ -128,6 +131,7 @@ export default function TranscriptSegmentEditor({ transcript, segments, onChange
     if (editingIdx === null) return;
     const updated = [...segments];
     updated[editingIdx] = { ...updated[editingIdx], title: editTitle.trim() || updated[editingIdx].title };
+    dlog("segmenter:edit", "rename segment", { idx: editingIdx, title: updated[editingIdx].title, segments: updated.length });
     onChange(updated);
     setEditingIdx(null);
   };

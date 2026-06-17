@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import { existsSync } from "fs";
 import path from "path";
 import { pythonInterpreter, SCRIPTS_DIR } from "../../_lib/spawn-python";
+import { dlog, derror } from "@/lib/debug";
 
 export const maxDuration = 600;
 export const dynamic = "force-dynamic";
@@ -12,26 +13,47 @@ export const dynamic = "force-dynamic";
 const SCRIPT_PATH = path.join(SCRIPTS_DIR, "clipper_transcribe.py");
 
 export async function POST(req: NextRequest) {
-  const { filePath } = await req.json();
+  const { filePath, hostLavPath, guestLavPath } = await req.json();
 
-  if (!filePath) {
-    return new Response(JSON.stringify({ error: "No file path provided" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+  // Dual-lav mode: transcribe two individual mics (host + guest) instead of the
+  // camera's audio. Both must be present and exist on disk; otherwise we fall
+  // back to single-file transcription of `filePath` (the camera).
+  const useLavs = !!(hostLavPath && guestLavPath);
+
+  if (useLavs) {
+    for (const p of [hostLavPath, guestLavPath]) {
+      if (!existsSync(p)) {
+        return new Response(JSON.stringify({ error: `File not found: ${p}` }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+  } else {
+    if (!filePath) {
+      return new Response(JSON.stringify({ error: "No file path provided" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (!existsSync(filePath)) {
+      return new Response(JSON.stringify({ error: "File not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   }
 
-  if (!existsSync(filePath)) {
-    return new Response(JSON.stringify({ error: "File not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  const args = useLavs
+    ? [SCRIPT_PATH, "--lavs", hostLavPath, guestLavPath]
+    : [SCRIPT_PATH, filePath];
+
+  dlog("clipper:transcribe", "spawn python", { mode: useLavs ? "lavs" : "single", args: args.slice(1) });
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     start(controller) {
-      const proc = spawn(pythonInterpreter(), [SCRIPT_PATH, filePath], {
+      const proc = spawn(pythonInterpreter(), args, {
         env: { ...process.env },
       });
 
@@ -58,12 +80,16 @@ export async function POST(req: NextRequest) {
       proc.stderr.on("data", (data: Buffer) => {
         const text = data.toString();
         stderrBuffer += text;
+        // Mirror the python worker's stderr (its [SNIPER:clipper] debug trace lives
+        // here) straight to the dev terminal so the whole flow is visible in one place.
+        process.stderr.write(text);
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify({ stderr: text.trim() })}\n\n`)
         );
       });
 
       proc.on("close", (code) => {
+        dlog("clipper:transcribe", "python exit", { code, stderrTail: code !== 0 ? stderrBuffer.slice(-1500) : undefined });
         clearInterval(keepalive);
         if (stdoutBuffer.trim()) {
           controller.enqueue(encoder.encode(`data: ${stdoutBuffer}\n\n`));
@@ -80,6 +106,7 @@ export async function POST(req: NextRequest) {
       });
 
       proc.on("error", (err) => {
+        derror("clipper:transcribe", "failed to spawn python", err);
         clearInterval(keepalive);
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify({ error: err.message })}\n\n`)

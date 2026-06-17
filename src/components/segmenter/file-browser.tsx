@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { TranscriptEntry, SegmentGroup } from "@/lib/types";
+import { dlog, summarize } from "@/lib/debug";
 
 interface Props {
   onComplete: (
@@ -133,8 +134,9 @@ export default function FileBrowser({ onComplete }: Props) {
         }),
       });
       const data = await res.json();
-      if (data.canceled) return;
-      if (data.error) { setPickError(data.error); return; }
+      if (data.canceled) { dlog("segmenter:browse", `pick ${SLOT_LABELS[slot]} canceled`); return; }
+      if (data.error) { dlog("segmenter:browse", `pick ${SLOT_LABELS[slot]} error`, data.error); setPickError(data.error); return; }
+      dlog("segmenter:browse", `picked ${SLOT_LABELS[slot]}`, { name: data.name, path: data.path });
       if (slot === "a") { setVideoPath(data.path); setVideoName(data.name); }
       else if (slot === "b") { setBcamPath(data.path); setBcamName(data.name); }
       else if (slot === "c") { setCcamPath(data.path); setCcamName(data.name); }
@@ -174,12 +176,19 @@ export default function FileBrowser({ onComplete }: Props) {
         }),
       });
       const data = await res.json();
-      if (data.canceled) return;
-      if (data.error) { setPickError(data.error); return; }
+      if (data.canceled) { dlog("segmenter:browse", "bulk pick canceled"); return; }
+      if (data.error) { dlog("segmenter:browse", "bulk pick error", data.error); setPickError(data.error); return; }
       const files: PickedFile[] = data.files ?? [];
+      dlog("segmenter:browse", "bulk picked files", { count: files.length, names: files.map((f) => f.name) });
       if (files.length === 0) return;
 
       const { assigned, leftovers } = autoAssign(files);
+      dlog("segmenter:browse", "auto-sort assignment", {
+        assigned: Object.fromEntries(
+          (Object.keys(assigned) as SlotKey[]).map((k) => [k, assigned[k]?.name]),
+        ),
+        leftovers: leftovers.map((f) => f.name),
+      });
       const order: SlotKey[] = ["a", "b", "c", "lav1", "lav2"];
       for (const slot of order) {
         const f = assigned[slot];
@@ -209,17 +218,26 @@ export default function FileBrowser({ onComplete }: Props) {
     setSegError(null);
     let segs: SegmentGroup[] = [];
     try {
+      dlog("segmenter:segment", "request → /api/segmenter/segment", {
+        transcriptLines: t.length,
+        prompt: summarize(DEFAULT_SEGMENT_PROMPT),
+      });
       const res = await fetch("/api/segmenter/segment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript: t, prompt: DEFAULT_SEGMENT_PROMPT }),
       });
       const data = await res.json();
-      if (data.error) setSegError(data.error);
-      else segs = data.segments ?? [];
+      if (data.error) { dlog("segmenter:segment", "response error", data.error); setSegError(data.error); }
+      else { segs = data.segments ?? []; dlog("segmenter:segment", "response segments", summarize(segs)); }
     } catch (e: unknown) {
       setSegError(e instanceof Error ? e.message : "Segmentation failed");
     }
+    dlog("segmenter:browse", "onComplete payload", {
+      transcriptLines: t.length,
+      segments: segs.length,
+      videoPath, bcamPath, ccamPath, lav1Path, lav2Path,
+    });
     onComplete(t, segs, videoPath, bcamPath, ccamPath, lav1Path, lav2Path);
   };
 
@@ -234,6 +252,7 @@ export default function FileBrowser({ onComplete }: Props) {
     const stderrChunks: string[] = [];
 
     try {
+      dlog("segmenter:transcribe", "request → /api/segmenter/transcribe", { filePath: videoPath });
       const res = await fetch("/api/segmenter/transcribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -258,7 +277,7 @@ export default function FileBrowser({ onComplete }: Props) {
           if (!raw) continue;
           try {
             const msg = JSON.parse(raw);
-            console.log("[transcribe]", msg);
+            dlog("segmenter:transcribe", `SSE ${msg.status ?? (msg.error ? "error" : msg.stderr ? "stderr" : "?")}`, summarize(msg));
             if (msg.error) { setTxStatus("error"); setTxError(msg.error); return; }
             if (msg.stderr) {
               stderrChunks.push(msg.stderr);

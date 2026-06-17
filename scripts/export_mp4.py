@@ -19,8 +19,24 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+_SNIPER_DEBUG = os.environ.get("SNIPER_DEBUG") != "0"
+
+
+def dbg(scope: str, event: str, **data):
+    if not _SNIPER_DEBUG:
+        return
+    try:
+        extra = json.dumps(data, default=str)
+    except Exception:
+        extra = str(data)
+    if len(extra) > 1500:
+        extra = extra[:1500] + f"… (+{len(extra) - 1500} more chars)"
+    print(f"[SNIPER:{scope}] {event} {extra}", file=sys.stderr, flush=True)
 
 
 PAD_SECONDS = 5.0
@@ -52,7 +68,14 @@ def render_one(main_video, start, end, output_path):
         "-movflags", "+faststart",
         output_path,
     ]
+    dbg("export", "render_one.start", output=os.path.basename(output_path),
+        start=start, end=end, padded_start=round(padded_start, 3),
+        padded_duration=round(padded_duration, 3), cmd=cmd)
+    t0 = time.monotonic()
     run_command(cmd)
+    size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    dbg("export", "render_one.done", output=os.path.basename(output_path),
+        size_mb=round(size / (1024 * 1024), 2), elapsed_s=round(time.monotonic() - t0, 2))
 
 
 def main():
@@ -67,6 +90,9 @@ def main():
     segments_json = sys.argv[2]
     output_zip = sys.argv[3]
 
+    dbg("export", "main.args", main_video=main_video, output_zip=output_zip,
+        pad_seconds=PAD_SECONDS, segments_json_len=len(segments_json))
+
     if not os.path.exists(main_video):
         print(json.dumps({"error": f"Main video not found: {main_video}"}), file=sys.stderr, flush=True)
         sys.exit(1)
@@ -75,6 +101,7 @@ def main():
         segments = json.loads(segments_json)
         if not isinstance(segments, list) or not segments:
             raise ValueError("segments must be a non-empty list")
+        dbg("export", "segments.parsed", count=len(segments))
 
         jobs = []
         with tempfile.TemporaryDirectory(prefix="clipper-mp4-") as work_dir:
@@ -92,6 +119,9 @@ def main():
             if not jobs:
                 raise ValueError("No valid segments (all empty or zero length)")
 
+            dbg("export", "jobs.built", count=len(jobs),
+                names=[arcname for arcname, _, _, _ in jobs])
+
             workers = 2
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = {
@@ -105,6 +135,9 @@ def main():
                 for arcname, temp_path, _, _ in jobs:
                     zf.write(temp_path, arcname=arcname)
 
+        zip_size = os.path.getsize(output_zip) if os.path.exists(output_zip) else 0
+        dbg("export", "zip.written", output_zip=output_zip,
+            clips=len(jobs), size_mb=round(zip_size / (1024 * 1024), 2))
         print(output_zip)
     except Exception as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)

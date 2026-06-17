@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
+import { dlog } from "@/lib/debug";
 
 const MIME_TYPES: Record<string, string> = {
   ".mp4": "video/mp4",
@@ -49,6 +50,12 @@ export async function GET(req: NextRequest) {
 
   const fileSize = stat.size;
   const rangeHeader = req.headers.get("range");
+
+  // Log the opening request (full file / first byte range) — skip mid-scrub
+  // ranges to avoid flooding the console during playback.
+  if (!rangeHeader || /bytes=0-/.test(rangeHeader)) {
+    dlog("clipper:video", "serve", { file: filePath.split("/").pop(), contentType, sizeMB: +(fileSize / 1048576).toFixed(1), range: rangeHeader ?? "full" });
+  }
 
   if (rangeHeader) {
     const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);

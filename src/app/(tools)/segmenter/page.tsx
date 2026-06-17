@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { TranscriptEntry, SegmentGroup } from "@/lib/types";
+import { dlog } from "@/lib/debug";
 import FileBrowser from "@/components/segmenter/file-browser";
 import TranscriptSegmentEditor from "@/components/segmenter/transcript-segment-editor";
 import SegmentExportStep from "@/components/segmenter/segment-export-step";
@@ -27,6 +28,15 @@ export default function Home() {
     lav1: string,
     lav2: string,
   ) => {
+    dlog("segmenter:browse", "transcribe+segment complete → edit step", {
+      transcriptLines: t.length,
+      segments: segs.length,
+      videoPath,
+      bcam,
+      ccam,
+      lav1,
+      lav2,
+    });
     setTranscript(t);
     setSegments(segs);
     setFilePath(videoPath);
@@ -50,7 +60,13 @@ export default function Home() {
             transcript={transcript}
             segments={segments}
             onChange={setSegments}
-            onContinue={() => setStep("export")}
+            onContinue={() => {
+              dlog("segmenter:edit", "continue → export step", {
+                segments: segments.length,
+                filePath,
+              });
+              setStep("export");
+            }}
           />
         )}
 

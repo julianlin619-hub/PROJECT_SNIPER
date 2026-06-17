@@ -5,6 +5,7 @@ import { EditableWord } from "@/lib/clipper/types";
 import { computeFinalClips, generateDebugTXT } from "@/lib/clipper/export";
 import { downloadText } from "@/lib/clipper/download";
 import { Button } from "@/components/ui/button";
+import { dlog } from "@/lib/debug";
 
 interface Props {
   words: EditableWord[];
@@ -45,6 +46,11 @@ export default function VideoEditor({ words, onChange, onContinue, videoSrc, fil
   // Drag selection state (refs to avoid stale closures in event handlers)
   const isDragging = useRef(false);
   const dragAnchorIdx = useRef<number>(-1);
+
+  useEffect(() => {
+    dlog("clipper:edit", "editor mounted", { words: words.length, durationSec: Math.round(duration), videoSrc });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Play from a given start time through all kept clips (skipping removed words)
   const playCurrentSegment = useCallback((fromTime?: number) => {

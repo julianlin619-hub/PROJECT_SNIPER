@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { SEGMENT_SYSTEM_PROMPT } from "@/prompts/segment-system";
+import { dlog, summarize } from "@/lib/debug";
 
 export const maxDuration = 900;
 export const dynamic = "force-dynamic";
@@ -45,6 +46,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    dlog("segmenter:segment", "incoming request", {
+      model: SEGMENT_MODEL,
+      transcriptLines: transcript.length,
+      prompt: summarize(prompt),
+    });
+
     const transcriptText = transcript
       .map((t, i) => {
         const header = `[LINE ${i}] [${t.start}s-${t.end}s] ${t.text}`;
@@ -69,6 +76,12 @@ export async function POST(req: NextRequest) {
       ],
     });
     const response = await stream.finalMessage();
+
+    dlog("segmenter:segment", "anthropic response", {
+      model: SEGMENT_MODEL,
+      stop_reason: response.stop_reason,
+      usage: response.usage,
+    });
 
     if (response.stop_reason === "max_tokens") {
       return NextResponse.json(
@@ -165,9 +178,11 @@ export async function POST(req: NextRequest) {
       };
     });
 
+    dlog("segmenter:segment", "returning enriched segments", summarize(enriched));
     return NextResponse.json({ segments: enriched });
   } catch (error: unknown) {
     console.error("[/api/segment] caught error:", error);
+    dlog("segmenter:segment", "caught error", error instanceof Error ? error.message : String(error));
     if (error instanceof Anthropic.APIError) {
       return NextResponse.json(
         { error: error.message, type: error.name, status: error.status },

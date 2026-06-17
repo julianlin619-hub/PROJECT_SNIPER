@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { SegmentGroup } from "@/lib/types";
+import { dlog, summarize } from "@/lib/debug";
 
 interface Props {
   segments: SegmentGroup[];
@@ -83,6 +84,14 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
     };
 
     try {
+      dlog("segmenter:multicam", "export request → /api/segmenter/multicam-export", {
+        acamPath: payload.acamPath,
+        bcamPath: payload.bcamPath,
+        ccamPath: payload.ccamPath,
+        lav1Path: payload.lav1Path,
+        lav2Path: payload.lav2Path,
+        segments: summarize(payload.segments),
+      });
       const res = await fetch("/api/segmenter/multicam-export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -108,7 +117,7 @@ export default function SegmentExportStep({ segments, filePath, bcamPath, ccamPa
           if (!raw) continue;
           try {
             const msg = JSON.parse(raw);
-            console.log("[multicam]", msg);
+            dlog("segmenter:multicam", `SSE ${msg.status ?? (msg.error ? "error" : msg.stderr ? "stderr" : "?")}`, summarize(msg));
             if (msg.error) { setMcError(msg.error); return; }
             if (msg.stderr) continue;
 

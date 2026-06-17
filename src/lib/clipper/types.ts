@@ -64,10 +64,32 @@ export interface Source {
   angles: CamAngle[];   // length 1 (A-only) or 2 (A+B)
   duration: number;
   fps: number;
-  // Channels routed on the primary angle's audio. 2 = channel-isolated stereo
-  // (Host on srcCh=1, Caller on srcCh=2); 1 = mono or cross-talk stereo
-  // downmixed during transcription. Drives FCPXML audio-channel-source emission.
+  // Channels routed on the primary angle's audio (only used when audioMode is
+  // "camera"). 2 = channel-isolated stereo (Host on srcCh=1, Caller on srcCh=2);
+  // 1 = mono or cross-talk stereo downmixed during transcription. Drives FCPXML
+  // audio-channel-source emission.
   audioChannels: 1 | 2;
+  // Where the exported FCPXML's dialogue audio comes from:
+  //   "camera" (default) — the primary angle's own audio channels (audioChannels above).
+  //   "lavs"             — two clean lav mics replace the cameras' audio. lav1Path
+  //                        (Host, speaker 0) and lav2Path (Guest, speaker 1) are
+  //                        attached as separate audio assets on Host/Guest roles,
+  //                        and the cameras' audio is muted.
+  audioMode?: "camera" | "lavs";
+  // Host lav (speaker 0) / Guest lav (speaker 1). Captured by the file browser;
+  // become the export audio sources when audioMode === "lavs".
+  lav1Path?: string;
+  lav2Path?: string;
+}
+
+// Result of transcription, passed from the file browser to the page so it can set
+// the speaker map. `twoSpeakers` means we know exactly two speakers (stereo
+// channels or two lav mics) and they map to speaker 0/1; `speakerKind` labels the
+// second speaker ("guest" for lav mode, "caller" for channel-isolated stereo).
+export interface TranscribeCompleteInfo {
+  twoSpeakers: boolean;
+  speakerKind: "guest" | "caller" | "diarized";
+  audioMode: "camera" | "lavs";
 }
 
 // App step flow

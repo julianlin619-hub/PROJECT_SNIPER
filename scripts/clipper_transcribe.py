@@ -8,17 +8,51 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import wave
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 from deepgram import AsyncDeepgramClient
 
+_SNIPER_DEBUG = os.environ.get("SNIPER_DEBUG") != "0"
+
+
+def dbg(scope: str, event: str, **data):
+    if not _SNIPER_DEBUG:
+        return
+    try:
+        extra = json.dumps(data, default=str)
+    except Exception:
+        extra = str(data)
+    if len(extra) > 1500:
+        extra = extra[:1500] + f"… (+{len(extra) - 1500} more chars)"
+    print(f"[SNIPER:{scope}] {event} {extra}", file=sys.stderr, flush=True)
+
+
 MAX_DEEPGRAM_FILE_SIZE = 25 * 1024 * 1024  # 25MB upload limit
 CHUNK_DURATION_SECONDS = 600  # 10 minutes per chunk
 FRAGMENT_TEMPLATE = "chunk-%03d.mp3"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+
+# --- Lav cross-talk suppression -------------------------------------------------
+# Each lav mic faintly picks up the OTHER speaker (bleed). Because we transcribe
+# each lav independently, that bleed is transcribed too — producing a duplicate of
+# the other person's words on the wrong track. A word transcribed on a track is
+# kept only when that track is the loudest at that moment; if the OTHER mic is
+# louder by CROSSTALK_DOMINANCE×, the word is bleed and is dropped.
+CROSSTALK_HOP = 800  # 50ms @ 16kHz — loudness-envelope resolution
+# Keep each mic only where its owner is the louder of the two (an automix gate).
+# 1.0 = silence a track wherever the other mic is louder. Raise (e.g. 1.3) only if
+# real speech is being clipped; lower toward 0.8 if bleed still leaks through.
+CROSSTALK_DOMINANCE = float(os.environ.get("CLIPPER_CROSSTALK_RATIO", "1.0"))
+# OFF by default: lav-mic bleed is handled downstream (the export merges overlapping
+# source ranges, and the edit prompt drops duplicate copies), which is far more robust
+# than gating the audio. Set CLIPPER_CROSSTALK=1 to re-enable the experimental gate.
+CROSSTALK_ENABLED = os.environ.get("CLIPPER_CROSSTALK") == "1"
+CROSSTALK_HANGOVER = int(os.environ.get("CLIPPER_CROSSTALK_HANGOVER", "4"))  # ±windows (~200ms) kept around speech to avoid clipping word edges
 
 
 def run_command(cmd: List[str]) -> str:
@@ -129,6 +163,72 @@ def is_channel_isolated(path: str, threshold: float = 0.65) -> bool:
         return False
 
 
+def _read_mono_pcm(path: str) -> Optional[np.ndarray]:
+    """Decode a file fully as 16kHz mono int16 PCM. None on any failure."""
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path,
+         "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+        capture_output=True,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return np.frombuffer(result.stdout, dtype=np.int16)
+
+
+def _envelope_from_pcm(pcm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Per-50ms RMS loudness envelope from mono int16 PCM; env[i] covers [i*hop,(i+1)*hop)."""
+    if pcm is None or pcm.size < CROSSTALK_HOP:
+        return None
+    n = pcm.size // CROSSTALK_HOP
+    framed = pcm[: n * CROSSTALK_HOP].astype(np.float32).reshape(n, CROSSTALK_HOP)
+    return np.sqrt((framed ** 2).mean(axis=1))
+
+
+def gate_track(pcm, this_env, other_env, noise_floor, label):
+    """Silence the parts of `pcm` where the OTHER mic clearly dominates (= bleed of the
+    other speaker). Returns a gated copy. Zeroing (not deleting) preserves the timeline,
+    so Deepgram timestamps still line up with the video.
+
+    Done BEFORE transcription so Deepgram only ever hears one speaker per track — this
+    is what prevents bleed words and prevents both voices being merged into one utterance.
+    """
+    n = int(min(this_env.shape[0], other_env.shape[0]))
+    te, oe = this_env[:n], other_env[:n]
+    # A window is bleed (silence it) when the other mic is loud AND clearly louder here.
+    silence = (oe > noise_floor) & (oe > te * CROSSTALK_DOMINANCE)
+    keep = ~silence
+    # Hangover: dilate kept regions by ±N windows so we don't clip the onset/tail of a
+    # real word that sits next to a silenced span.
+    if CROSSTALK_HANGOVER > 0 and keep.any():
+        dilated = keep.copy()
+        for s in range(1, CROSSTALK_HANGOVER + 1):
+            dilated[s:] |= keep[:-s]
+            dilated[:-s] |= keep[s:]
+        keep = dilated
+    mask = np.repeat(keep, CROSSTALK_HOP)
+    gated = pcm.copy()
+    m = int(min(mask.shape[0], gated.shape[0]))
+    gated[:m] = np.where(mask[:m], gated[:m], np.int16(0))
+    hop_s = CROSSTALK_HOP / 16000.0
+    dbg("clipper", "gate.track", track=label, windows=n,
+        kept_windows=int(keep.sum()), silenced_windows=int((~keep).sum()),
+        kept_seconds=round(int(keep.sum()) * hop_s, 1),
+        silenced_seconds=round(int((~keep).sum()) * hop_s, 1))
+    return gated
+
+
+def write_temp_wav(pcm: np.ndarray, sr: int = 16000) -> str:
+    """Write mono int16 PCM to a temp WAV; caller must delete it."""
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="clipper-gated-")
+    os.close(fd)
+    with wave.open(tmp, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.astype(np.int16).tobytes())
+    return tmp
+
+
 def extract_channel(video_path: str, channel: int) -> str:
     """Extract one stereo channel (0=left/host, 1=right/caller) as a mono MP3.
 
@@ -163,9 +263,11 @@ async def transcribe_channel(
     Returns (entries, detected_language).  All word-level speaker fields are
     set to speaker_id — diarization is disabled since we already know the speaker.
     """
+    dbg("clipper", "channel.enter", audio_path=audio_path, speaker_id=speaker_id, audio_offset=audio_offset)
     chunk_paths, chunk_dir = split_audio_if_needed(audio_path)
     total_chunks = len(chunk_paths)
     offsets = get_chunk_offsets(audio_path, total_chunks) if total_chunks > 1 else [0.0]
+    dbg("clipper", "channel.plan", speaker_id=speaker_id, total_chunks=total_chunks, offsets=offsets)
 
     entries: List[dict] = []
     detected_language: Optional[str] = None
@@ -175,6 +277,9 @@ async def transcribe_channel(
             with open(chunk_path, "rb") as f:
                 audio_bytes = f.read()
 
+            dbg("clipper", "deepgram.request", model="nova-3", diarize=False,
+                speaker_id=speaker_id, chunk=idx, total=total_chunks, file=os.path.basename(chunk_path))
+            _t0 = time.monotonic()
             response = await client.listen.v1.media.transcribe_file(
                 request=audio_bytes,
                 model="nova-3",
@@ -187,6 +292,11 @@ async def transcribe_channel(
 
             chunk_data = response.model_dump()
             chunk_entries = build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset)
+            _utts = chunk_data.get("results", {}).get("utterances") or []
+            dbg("clipper", "deepgram.response", speaker_id=speaker_id, chunk=idx,
+                num_utterances=len(_utts), num_entries=len(chunk_entries),
+                num_words=sum(len(e.get("words", [])) for e in chunk_entries),
+                elapsed_s=round(time.monotonic() - _t0, 2))
 
             # Stamp every word with the known speaker_id (channel-based, not diarized)
             for entry in chunk_entries:
@@ -203,6 +313,8 @@ async def transcribe_channel(
         if chunk_dir and os.path.exists(chunk_dir):
             shutil.rmtree(chunk_dir)
 
+    dbg("clipper", "channel.exit", speaker_id=speaker_id, num_entries=len(entries),
+        num_words=sum(len(e.get("words", [])) for e in entries), language=detected_language)
     return entries, detected_language
 
 
@@ -212,12 +324,14 @@ async def run_stereo_transcription(video_path: str, audio_offset: float = 0.0) -
     Left channel → speaker 0 (host), right channel → speaker 1 (caller).
     Entries from both channels are merged and sorted by start time.
     """
+    dbg("clipper", "stereo.enter", video_path=video_path, audio_offset=audio_offset)
     _, duration = get_audio_metadata(video_path)
 
     print(json.dumps({"status": "extracting_channels"}), flush=True)
     left_path = extract_channel(video_path, 0)
     right_path = extract_channel(video_path, 1)
     size_mb = round((os.path.getsize(left_path) + os.path.getsize(right_path)) / (1024 * 1024), 1)
+    dbg("clipper", "stereo.channels_extracted", left=left_path, right=right_path, size_mb=size_mb)
     print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
 
     client = AsyncDeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"])
@@ -240,6 +354,103 @@ async def run_stereo_transcription(video_path: str, audio_offset: float = 0.0) -
 
     transcript = sorted(left_entries + right_entries, key=lambda e: e["start"])
     duration_out = duration if duration > 0 else (transcript[-1]["end"] if transcript else 0)
+    dbg("clipper", "stereo.exit", num_entries=len(transcript),
+        duration=duration_out, language=detected_language or "en")
+
+    print(
+        json.dumps({
+            "status": "done",
+            "transcript": transcript,
+            "duration": duration_out,
+            "fps": 0,
+            "language": detected_language or "en",
+            "model": "deepgram:nova-3",
+        }),
+        flush=True,
+    )
+
+
+async def run_lav_transcription(host_lav: str, guest_lav: str) -> None:
+    """Transcribe two separate mono lav files: host (speaker 0) + guest (speaker 1).
+
+    The lavs are already individual mics (one per person) and are pre-synced to the
+    same timeline as the cameras, so there is no channel extraction and no Deepgram
+    diarization — each file's speaker is known. Entries from both are merged and
+    sorted by start time, exactly like the stereo path.
+
+    The lav files are USER INPUTS, not producer-created temp files, so this function
+    must NOT delete them (transcribe_channel still cleans its own chunk dirs).
+    """
+    # Each lav carries its own container start_time; correct intra-file timestamps
+    # by that offset. (We do NOT align the two files to each other — they're
+    # assumed pre-synced; cross-file alignment is SEGMENTER's job.)
+    dbg("clipper", "lav.enter", host_lav=host_lav, guest_lav=guest_lav)
+    host_offset, host_dur = get_audio_metadata(host_lav)
+    guest_offset, guest_dur = get_audio_metadata(guest_lav)
+    dbg("clipper", "lav.metadata", host_offset=host_offset, host_dur=host_dur,
+        guest_offset=guest_offset, guest_dur=guest_dur)
+
+    size_mb = round(
+        (os.path.getsize(host_lav) + os.path.getsize(guest_lav)) / (1024 * 1024), 1
+    )
+    print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": host_offset}), flush=True)
+
+    client = AsyncDeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"])
+    detected_language: Optional[str] = None
+
+    # --- Cross-talk gating (BEFORE transcription) ---------------------------------
+    # Each mic bleeds the other speaker. We silence the bleed in each track's AUDIO
+    # before sending it to Deepgram, so Deepgram only ever hears one speaker per track.
+    # This prevents duplicate (bleed) words AND prevents both voices being stitched
+    # into one utterance. We transcribe the gated WAVs; the raw lavs are untouched.
+    host_in, guest_in = host_lav, guest_lav
+    host_off_in, guest_off_in = host_offset, guest_offset
+    gated_paths: List[str] = []
+    if CROSSTALK_ENABLED:
+        host_pcm = _read_mono_pcm(host_lav)
+        guest_pcm = _read_mono_pcm(guest_lav)
+        host_env = _envelope_from_pcm(host_pcm)
+        guest_env = _envelope_from_pcm(guest_pcm)
+        if host_pcm is not None and guest_pcm is not None and host_env is not None and guest_env is not None:
+            noise_floor = max(50.0, 0.01 * max(float(host_env.max()), float(guest_env.max())))
+            dbg("clipper", "gate.enter", host_env_hops=int(host_env.shape[0]),
+                guest_env_hops=int(guest_env.shape[0]), noise_floor=round(noise_floor, 1),
+                dominance=CROSSTALK_DOMINANCE, hangover=CROSSTALK_HANGOVER)
+            host_gated = gate_track(host_pcm, host_env, guest_env, noise_floor, "host")
+            guest_gated = gate_track(guest_pcm, guest_env, host_env, noise_floor, "guest")
+            host_in = write_temp_wav(host_gated)
+            guest_in = write_temp_wav(guest_gated)
+            gated_paths = [host_in, guest_in]
+            host_off_in = guest_off_in = 0.0  # fresh WAVs start at t=0
+            dbg("clipper", "gate.written", host=host_in, guest=guest_in)
+        else:
+            dbg("clipper", "gate.skipped", reason="pcm/envelope decode failed",
+                host_ok=host_pcm is not None, guest_ok=guest_pcm is not None)
+    else:
+        dbg("clipper", "gate.disabled", note="CLIPPER_CROSSTALK=0")
+
+    try:
+        print(json.dumps({"status": "transcribing_chunk", "chunk": 1, "total": 2}), flush=True)
+        host_entries, lang = await transcribe_channel(client, host_in, speaker_id=0, audio_offset=host_off_in)
+        if lang:
+            detected_language = lang
+
+        print(json.dumps({"status": "transcribing_chunk", "chunk": 2, "total": 2}), flush=True)
+        guest_entries, lang = await transcribe_channel(client, guest_in, speaker_id=1, audio_offset=guest_off_in)
+        if lang and not detected_language:
+            detected_language = lang
+    finally:
+        # Gated WAVs are producer-owned temps; the raw lavs (user inputs) are never deleted.
+        for p in gated_paths:
+            if p and os.path.exists(p):
+                os.unlink(p)
+
+    transcript = sorted(host_entries + guest_entries, key=lambda e: e["start"])
+    duration_out = max(host_dur, guest_dur)
+    if duration_out <= 0:
+        duration_out = transcript[-1]["end"] if transcript else 0
+    dbg("clipper", "lav.exit", num_entries=len(transcript),
+        duration=duration_out, language=detected_language or "en")
 
     print(
         json.dumps({
@@ -256,6 +467,8 @@ async def run_stereo_transcription(video_path: str, audio_offset: float = 0.0) -
 
 def split_audio_if_needed(audio_path: str) -> tuple[List[str], Optional[str]]:
     size = os.path.getsize(audio_path)
+    dbg("clipper", "split.check", audio_path=audio_path,
+        size_mb=round(size / (1024 * 1024), 2), limit_mb=round(MAX_DEEPGRAM_FILE_SIZE / (1024 * 1024), 1))
     if size <= MAX_DEEPGRAM_FILE_SIZE:
         return [audio_path], None
 
@@ -278,6 +491,8 @@ def split_audio_if_needed(audio_path: str) -> tuple[List[str], Optional[str]]:
         raise RuntimeError("Chunking produced no files")
 
     chunk_paths = [str(c) for c in chunks]
+    dbg("clipper", "split.chunks", count=len(chunk_paths),
+        sizes_mb=[round(os.path.getsize(p) / (1024 * 1024), 2) for p in chunk_paths])
     print(json.dumps({"status": "chunking_complete", "chunks": len(chunk_paths)}), flush=True)
     return chunk_paths, temp_dir
 
@@ -346,10 +561,12 @@ def build_transcript_entries(chunk_data: dict, offset: float) -> List[dict]:
 
 async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
     """Single async entry point — all Deepgram calls happen here."""
+    dbg("clipper", "run.enter", audio_path=audio_path, audio_offset=audio_offset)
     _, duration = get_audio_metadata(audio_path)
     chunk_paths, chunk_dir = split_audio_if_needed(audio_path)
     total_chunks = len(chunk_paths)
     offsets = get_chunk_offsets(audio_path, total_chunks) if total_chunks > 1 else [0.0]
+    dbg("clipper", "run.plan", probe_duration=duration, total_chunks=total_chunks, offsets=offsets)
 
     client = AsyncDeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"])
     transcript: List[dict] = []
@@ -361,6 +578,9 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
                 json.dumps({"status": "transcribing_chunk", "chunk": idx, "total": total_chunks}),
                 flush=True,
             )
+            dbg("clipper", "deepgram.request", model="nova-3", diarize=True,
+                chunk=idx, total=total_chunks, file=os.path.basename(chunk_path), language=detected_language)
+            _t0 = time.monotonic()
 
             transcribe_kwargs = dict(
                 model="nova-3",
@@ -382,7 +602,13 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
             )
 
             chunk_data = response.model_dump()
-            transcript.extend(build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset))
+            chunk_entries = build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset)
+            transcript.extend(chunk_entries)
+            _utts = chunk_data.get("results", {}).get("utterances") or []
+            dbg("clipper", "deepgram.response", chunk=idx,
+                num_utterances=len(_utts), num_entries=len(chunk_entries),
+                num_words=sum(len(e.get("words", [])) for e in chunk_entries),
+                elapsed_s=round(time.monotonic() - _t0, 2))
 
             if not detected_language:
                 channels = chunk_data.get("results", {}).get("channels", [])
@@ -393,6 +619,9 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
             shutil.rmtree(chunk_dir)
 
     duration = duration if duration > 0 else (transcript[-1]["end"] if transcript else 0)
+    dbg("clipper", "run.done", num_entries=len(transcript),
+        num_words=sum(len(e.get("words", [])) for e in transcript),
+        duration=duration, language=detected_language or "en")
 
     print(
         json.dumps(
@@ -411,10 +640,35 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
 
 async def main() -> None:
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: transcribe.py <audio_path>"}), flush=True)
+        print(json.dumps({"error": "Usage: transcribe.py <audio_path> | transcribe.py --lavs <host_lav> <guest_lav>"}), flush=True)
         sys.exit(1)
 
+    # Dual-lav mode: transcribe two individual mics (host=speaker 0, guest=speaker 1).
+    if sys.argv[1] == "--lavs":
+        if len(sys.argv) < 4:
+            print(json.dumps({"error": "Usage: transcribe.py --lavs <host_lav> <guest_lav>"}), flush=True)
+            sys.exit(1)
+        host_lav, guest_lav = sys.argv[2], sys.argv[3]
+        dbg("clipper", "main.mode", mode="lavs", host_lav=host_lav, guest_lav=guest_lav)
+        for p in (host_lav, guest_lav):
+            if not os.path.exists(p):
+                print(json.dumps({"error": f"File not found: {p}"}), flush=True)
+                sys.exit(1)
+            if not any(p.lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
+                print(json.dumps({"error": f"Lav inputs must be audio files: {p}"}), flush=True)
+                sys.exit(1)
+        if not os.environ.get("DEEPGRAM_API_KEY"):
+            print(json.dumps({"error": "DEEPGRAM_API_KEY not set"}), flush=True)
+            sys.exit(1)
+        try:
+            await run_lav_transcription(host_lav, guest_lav)
+        except Exception as exc:
+            print(json.dumps({"error": str(exc)}), flush=True)
+            sys.exit(1)
+        return
+
     audio_path = sys.argv[1]
+    dbg("clipper", "main.mode", mode="single-file", audio_path=audio_path)
 
     if not os.path.exists(audio_path):
         print(json.dumps({"error": f"File not found: {audio_path}"}), flush=True)
@@ -442,7 +696,10 @@ async def main() -> None:
 
             channels = get_channel_count(audio_path)
             print(json.dumps({"status": "channel_detected", "channels": channels}), flush=True)
-            if channels >= 2 and is_channel_isolated(audio_path):
+            isolated = channels >= 2 and is_channel_isolated(audio_path)
+            dbg("clipper", "main.channels", channels=channels, audio_offset=audio_offset,
+                channel_isolated=isolated)
+            if isolated:
                 # Channel-isolated stereo: left = host (speaker 0), right = caller (speaker 1)
                 await run_stereo_transcription(audio_path, audio_offset=audio_offset)
                 return
@@ -462,6 +719,7 @@ async def main() -> None:
                 print(json.dumps({"error": f"ffmpeg audio extraction failed: {result.stderr.strip()}"}), flush=True)
                 sys.exit(1)
             size_mb = round(os.path.getsize(tmp) / (1024 * 1024), 1)
+            dbg("clipper", "main.extracted", tmp=tmp, size_mb=size_mb, audio_offset=audio_offset)
             print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
             extracted_audio_path = tmp
             audio_path = tmp

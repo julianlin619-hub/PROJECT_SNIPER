@@ -10,8 +10,15 @@ function fmt(seconds: number): string {
  * Merge consecutive kept words into contiguous clips.
  *
  * A new clip starts wherever one or more removed words create a gap.
- * Words are processed in their original order, so the output is a
- * time-ordered list of { start, end, text } clips ready for FCPXML.
+ * Words are processed in their original order, producing a list of
+ * { start, end, text } clips.
+ *
+ * Final coalesce pass: clips are sorted by source start and any clips whose
+ * SOURCE ranges overlap are merged into one. This is what makes the cut robust
+ * to lav-mic bleed — the same moment is transcribed twice (once per mic), and if
+ * the editor keeps both copies they'd otherwise be laid back-to-back and play
+ * TWICE. In this assembly tool an intentional cut never re-uses the same source
+ * moment, so overlapping ranges are always duplicates and merging is safe.
  */
 export function computeFinalClips(
   words: EditableWord[]
@@ -38,7 +45,20 @@ export function computeFinalClips(
     clips.push({ start: current.start, end: current.end, text: current.words.join(" ") });
   }
 
-  return clips;
+  // Coalesce overlapping source ranges (bleed duplicates) so no moment plays twice.
+  clips.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: { start: number; end: number; text: string }[] = [];
+  for (const c of clips) {
+    const last = merged[merged.length - 1];
+    if (last && c.start <= last.end) {
+      last.end = Math.max(last.end, c.end);
+      if (c.text && c.text !== last.text) last.text = `${last.text} ${c.text}`.trim();
+    } else {
+      merged.push({ ...c });
+    }
+  }
+
+  return merged;
 }
 
 

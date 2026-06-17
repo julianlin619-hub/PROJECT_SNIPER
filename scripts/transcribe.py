@@ -8,10 +8,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
 from deepgram import AsyncDeepgramClient
+
+_SNIPER_DEBUG = os.environ.get("SNIPER_DEBUG") != "0"
+
+
+def dbg(scope: str, event: str, **data):
+    if not _SNIPER_DEBUG:
+        return
+    try:
+        extra = json.dumps(data, default=str)
+    except Exception:
+        extra = str(data)
+    if len(extra) > 1500:
+        extra = extra[:1500] + f"… (+{len(extra) - 1500} more chars)"
+    print(f"[SNIPER:{scope}] {event} {extra}", file=sys.stderr, flush=True)
+
 
 MAX_DEEPGRAM_FILE_SIZE = 25 * 1024 * 1024  # 25MB upload limit
 CHUNK_DURATION_SECONDS = 600  # 10 minutes per chunk
@@ -49,6 +65,8 @@ def get_audio_metadata(audio_path: str) -> tuple[float, float]:
 
 def split_audio_if_needed(audio_path: str) -> tuple[List[str], Optional[str]]:
     size = os.path.getsize(audio_path)
+    dbg("transcribe", "split.check", audio_path=audio_path,
+        size_mb=round(size / (1024 * 1024), 2), limit_mb=round(MAX_DEEPGRAM_FILE_SIZE / (1024 * 1024), 1))
     if size <= MAX_DEEPGRAM_FILE_SIZE:
         return [audio_path], None
 
@@ -76,6 +94,8 @@ def split_audio_if_needed(audio_path: str) -> tuple[List[str], Optional[str]]:
         raise RuntimeError("Chunking produced no files")
 
     chunk_paths = [str(c) for c in chunks]
+    dbg("transcribe", "split.chunks", count=len(chunk_paths),
+        sizes_mb=[round(os.path.getsize(p) / (1024 * 1024), 2) for p in chunk_paths])
     oversized = [(p, os.path.getsize(p)) for p in chunk_paths if os.path.getsize(p) > MAX_DEEPGRAM_FILE_SIZE]
     if oversized:
         biggest = max(oversized, key=lambda t: t[1])
@@ -152,10 +172,12 @@ def build_transcript_entries(chunk_data: dict, offset: float) -> List[dict]:
 
 async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
     """Single async entry point — all Deepgram calls happen here."""
+    dbg("transcribe", "run.enter", audio_path=audio_path, audio_offset=audio_offset)
     _, duration = get_audio_metadata(audio_path)
     chunk_paths, chunk_dir = split_audio_if_needed(audio_path)
     total_chunks = len(chunk_paths)
     offsets = get_chunk_offsets(audio_path, total_chunks) if total_chunks > 1 else [0.0]
+    dbg("transcribe", "run.plan", probe_duration=duration, total_chunks=total_chunks, offsets=offsets)
 
     client = AsyncDeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"])
     transcript: List[dict] = []
@@ -167,6 +189,9 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
                 json.dumps({"status": "transcribing_chunk", "chunk": idx, "total": total_chunks}),
                 flush=True,
             )
+            dbg("transcribe", "deepgram.request", model="nova-3",
+                chunk=idx, total=total_chunks, file=os.path.basename(chunk_path), language=detected_language)
+            _t0 = time.monotonic()
 
             transcribe_kwargs = dict(
                 model="nova-3",
@@ -187,7 +212,13 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
             )
 
             chunk_data = response.model_dump()
-            transcript.extend(build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset))
+            chunk_entries = build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset)
+            transcript.extend(chunk_entries)
+            _utts = chunk_data.get("results", {}).get("utterances") or []
+            dbg("transcribe", "deepgram.response", chunk=idx,
+                num_utterances=len(_utts), num_entries=len(chunk_entries),
+                num_words=sum(len(e.get("words", [])) for e in chunk_entries),
+                elapsed_s=round(time.monotonic() - _t0, 2))
 
             if not detected_language:
                 channels = chunk_data.get("results", {}).get("channels", [])
@@ -198,6 +229,9 @@ async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
             shutil.rmtree(chunk_dir)
 
     duration = duration if duration > 0 else (transcript[-1]["end"] if transcript else 0)
+    dbg("transcribe", "run.done", num_entries=len(transcript),
+        num_words=sum(len(e.get("words", [])) for e in transcript),
+        duration=duration, language=detected_language or "en")
 
     print(
         json.dumps(
@@ -227,6 +261,7 @@ async def main() -> None:
 
     is_video = any(audio_path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
     is_audio = any(audio_path.lower().endswith(ext) for ext in AUDIO_EXTENSIONS)
+    dbg("transcribe", "main.input", audio_path=audio_path, is_video=is_video, is_audio=is_audio)
 
     if not is_audio and not is_video:
         print(json.dumps({"error": "Unsupported file type. Please provide a video (mp4, mov) or audio file (mp3, wav, m4a, etc.)"}), flush=True)
@@ -242,6 +277,8 @@ async def main() -> None:
     try:
         source_size = os.path.getsize(audio_path)
         needs_normalize = is_video or source_size > MAX_DEEPGRAM_FILE_SIZE
+        dbg("transcribe", "main.normalize", source_size_mb=round(source_size / (1024 * 1024), 2),
+            needs_normalize=needs_normalize)
 
         if needs_normalize:
             audio_start, _ = get_audio_metadata(audio_path)
@@ -264,6 +301,7 @@ async def main() -> None:
                 print(json.dumps({"error": f"ffmpeg audio extraction failed: {result.stderr.strip()[-500:]}"}), flush=True)
                 sys.exit(1)
             size_mb = round(os.path.getsize(tmp) / (1024 * 1024), 1)
+            dbg("transcribe", "main.extracted", tmp=tmp, size_mb=size_mb, audio_offset=audio_offset)
             print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
             extracted_audio_path = tmp
             audio_path = tmp

@@ -5,6 +5,7 @@ import { TranscriptEntry, LineDecision, SpeakerMap } from "@/lib/clipper/types";
 import { parseIndexedDecisions } from "@/lib/clipper/llm";
 import { Button } from "@/components/ui/button";
 import { DEFAULT_EDIT_PROMPT } from "@/prompts/clipper/default-edit";
+import { dlog, derror } from "@/lib/debug";
 
 interface Props {
   transcript: TranscriptEntry[];
@@ -70,6 +71,8 @@ export default function PromptStep({ transcript, speakerMap, onComplete }: Props
     setRawOutput("");
     setGenerating(true);
 
+    dlog("clipper:prompt", "generate edit decisions", { utterances: transcript.length, promptChars: DEFAULT_EDIT_PROMPT.length });
+
     try {
       const res = await fetch("/api/clipper/clip-preview", {
         method: "POST",
@@ -97,6 +100,7 @@ export default function PromptStep({ transcript, speakerMap, onComplete }: Props
       setGenerating(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
+      derror("clipper:prompt", "generate failed", err);
       setGenerating(false);
     }
   }, [transcript, speakerMap]);
@@ -104,9 +108,16 @@ export default function PromptStep({ transcript, speakerMap, onComplete }: Props
   const handleContinue = useCallback(() => {
     try {
       const { decisions } = parseIndexedDecisions(rawOutput, transcript.length, 0);
+      dlog("clipper:prompt", "parsed decisions → continue", {
+        total: decisions.length,
+        keep: decisions.filter((d) => d.action === "keep").length,
+        remove: decisions.filter((d) => d.action === "remove").length,
+        trim: decisions.filter((d) => d.action === "trim").length,
+      });
       onComplete(decisions);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to parse LLM output");
+      derror("clipper:prompt", "parse decisions failed", err);
     }
   }, [rawOutput, transcript.length, onComplete]);
 

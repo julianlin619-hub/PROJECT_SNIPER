@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import { existsSync } from "fs";
 import path from "path";
 import { pythonInterpreter, SCRIPTS_DIR } from "../../_lib/spawn-python";
+import { dlog } from "@/lib/debug";
 
 export const maxDuration = 600;
 export const dynamic = "force-dynamic";
@@ -29,6 +30,7 @@ export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     start(controller) {
+      dlog("segmenter:transcribe", "spawn transcribe.py", { interpreter: pythonInterpreter(), script: SCRIPT_PATH, filePath });
       const proc = spawn(pythonInterpreter(), [SCRIPT_PATH, filePath], {
         env: { ...process.env },
       });
@@ -48,6 +50,7 @@ export async function POST(req: NextRequest) {
         stdoutBuffer = parts.pop() || "";
         for (const line of parts) {
           if (line.trim()) {
+            if (line.includes('"done"')) dlog("segmenter:transcribe", "transcribe.py emitted done");
             controller.enqueue(encoder.encode(`data: ${line}\n\n`));
           }
         }
@@ -69,6 +72,7 @@ export async function POST(req: NextRequest) {
           stdoutBuffer = "";
         }
         console.log(`[transcribe.py] exited with code ${code}`);
+        dlog("segmenter:transcribe", "transcribe.py closed", { code });
         if (code !== 0) {
           controller.enqueue(
             encoder.encode(

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { spawn } from "child_process";
+import { dlog } from "@/lib/debug";
 
 function runOsascript(script: string): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
@@ -35,6 +36,8 @@ export async function POST(req: Request) {
     if (body?.multiple === true) multiple = true;
   } catch { /* empty body is fine */ }
 
+  dlog("segmenter:pick", "picker request", { prompt, kind, multiple });
+
   const safePrompt = prompt.replace(/["\\]/g, "\\$&");
   // public.audio is the parent UTI; covers wav/mp3/m4a/aac/flac/ogg/opus.
   const VIDEO_UTIS = `"public.movie", "public.mpeg-4", "com.apple.quicktime-movie"`;
@@ -59,8 +62,10 @@ return out`
   if (code !== 0) {
     // -128 is "User canceled" in AppleScript.
     if (/User canceled|-128/i.test(stderr)) {
+      dlog("segmenter:pick", "picker canceled");
       return NextResponse.json({ canceled: true });
     }
+    dlog("segmenter:pick", "picker error", stderr.trim() || "Picker failed");
     return NextResponse.json(
       { error: stderr.trim() || "Picker failed" },
       { status: 500 },
@@ -73,12 +78,20 @@ return out`
       .map((p) => p.trim())
       .filter(Boolean)
       .map((p) => ({ path: p, name: p.split("/").pop() || p }));
-    if (files.length === 0) return NextResponse.json({ canceled: true });
+    if (files.length === 0) {
+      dlog("segmenter:pick", "picker canceled (no files)");
+      return NextResponse.json({ canceled: true });
+    }
+    dlog("segmenter:pick", "picked files", { count: files.length, paths: files.map((f) => f.path) });
     return NextResponse.json({ files });
   }
 
   const filePath = stdout.trim();
-  if (!filePath) return NextResponse.json({ canceled: true });
+  if (!filePath) {
+    dlog("segmenter:pick", "picker canceled (no path)");
+    return NextResponse.json({ canceled: true });
+  }
   const name = filePath.split("/").pop() || filePath;
+  dlog("segmenter:pick", "picked file", { path: filePath });
   return NextResponse.json({ path: filePath, name });
 }

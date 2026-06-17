@@ -70,7 +70,9 @@ _log_lock = threading.Lock()
 # SSE route parses as JSON status events) — the export route mirrors stderr live
 # to the `npm run dev` console. Enable with MULTICAM_DEBUG=1. Lines are prefixed
 # with elapsed seconds and tagged with a thread/segment label where relevant.
-DEBUG = os.environ.get("MULTICAM_DEBUG") == "1"
+# The project-wide SNIPER_DEBUG flag (ON by default, off only when set to "0")
+# also enables this tracing, so the same env var lights up every script's logs.
+DEBUG = os.environ.get("MULTICAM_DEBUG") == "1" or os.environ.get("SNIPER_DEBUG") != "0"
 _t0 = time.monotonic()
 
 

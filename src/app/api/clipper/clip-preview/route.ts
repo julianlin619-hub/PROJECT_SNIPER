@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { TranscriptEntry, SpeakerMap, WordTiming } from "@/lib/clipper/types";
+import { dlog, derror, DEBUG_ENABLED } from "@/lib/debug";
 
 /** Returns the dominant speaker ID across all words in an utterance (majority vote). */
 function getUtteranceSpeaker(words: WordTiming[] | undefined): number | null {
@@ -85,6 +86,14 @@ export async function POST(req: NextRequest) {
     "You are a short-form content editor that is able to identify and extract the strongest clips from raw transcripts — prioritizing hooks, emotional peaks, and high-retention storytelling.";
   const systemPrompt = `${role}\n\n${prompt}`;
 
+  dlog("clipper:clip-preview", "LLM request", {
+    model: "claude-sonnet-4-6",
+    utterances: transcript.length,
+    promptChars: prompt.length,
+    systemChars: systemPrompt.length,
+    speakerMap: resolvedMap ?? null,
+  });
+
   const claudeStream = anthropic.messages.stream({
     model: "claude-sonnet-4-6",
     max_tokens: 32000,
@@ -96,6 +105,7 @@ export async function POST(req: NextRequest) {
 
   const shouldDumpFixture = process.env.CLIPPER_DUMP_FIXTURE === "1";
   let capturedToolInput = "";
+  let debugBuf = "";
 
   // Stream the tool call's JSON input to the client as it's generated
   const readable = new ReadableStream({
@@ -109,9 +119,16 @@ export async function POST(req: NextRequest) {
             const piece = chunk.delta.partial_json;
             controller.enqueue(new TextEncoder().encode(piece));
             if (shouldDumpFixture) capturedToolInput += piece;
+            if (DEBUG_ENABLED) debugBuf += piece;
           }
         }
         controller.close();
+
+        if (DEBUG_ENABLED) {
+          let decisionCount = 0;
+          try { decisionCount = (JSON.parse(debugBuf).decisions ?? []).length; } catch { /* partial */ }
+          dlog("clipper:clip-preview", "LLM response (decisions)", { jsonChars: debugBuf.length, decisions: decisionCount });
+        }
 
         if (shouldDumpFixture && capturedToolInput) {
           // Dev-only fixture dump — the stream is already closed, so a write
@@ -143,6 +160,7 @@ export async function POST(req: NextRequest) {
           }
         }
       } catch (err) {
+        derror("clipper:clip-preview", "LLM stream failed", err);
         controller.error(err);
       }
     },

@@ -5,6 +5,7 @@ import { EditableWord, TranscriptEntry, SpeakerMap, Source } from "@/lib/clipper
 import { computeFinalClips, generateExampleTranscript, generateExampleDecisions } from "@/lib/clipper/export";
 import { generateFCPXML } from "@/lib/clipper/xml";
 import { downloadBlob, downloadText } from "@/lib/clipper/download";
+import { dlog, derror, summarize } from "@/lib/debug";
 import { Download } from "lucide-react";
 
 interface Props {
@@ -21,6 +22,7 @@ export default function ExportStep({ versionWords, source, transcript = [], spea
   const baseName = primaryFileName.replace(/\.\w+$/, "");
   const speakerLabels: [string, string] = [speakerMap?.[0] ?? "Speaker", speakerMap?.[1] ?? "Guest"];
   const isMultiCam = source.angles.length > 1;
+  const isLavAudio = source.audioMode === "lavs" && !!source.lav1Path && !!source.lav2Path;
 
   const downloadExample = (words: EditableWord[], versionIdx: number) => {
     const output =
@@ -40,14 +42,27 @@ export default function ExportStep({ versionWords, source, transcript = [], spea
           onClick={() => {
             setError(null);
             try {
+              dlog("clipper:export", "export FCPXML", {
+                versions: versionWords.length,
+                audioMode: source.audioMode ?? "camera",
+                isMultiCam, isLavAudio, speakerLabels,
+                lavs: { host: source.lav1Path?.split("/").pop(), guest: source.lav2Path?.split("/").pop() },
+              });
               versionWords.forEach((words, i) => {
                 const clips = computeFinalClips(words);
                 const xml = generateFCPXML(clips, source, speakerLabels);
+                dlog("clipper:export", `v${i + 1} → fcpxml`, {
+                  clips: clips.length,
+                  firstClip: clips[0] ? { start: clips[0].start, end: clips[0].end } : null,
+                  totalSeconds: clips.reduce((a, c) => a + (c.end - c.start), 0),
+                  xmlChars: xml.length,
+                  xmlHead: summarize(xml, 600),
+                });
                 const blob = new Blob([xml], { type: "application/xml" });
                 const suffix = versionWords.length > 1 ? `_clipper_v${i + 1}` : "_clipper";
                 downloadBlob(blob, baseName + suffix + ".fcpxml");
               });
-            } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+            } catch (e) { setError(e instanceof Error ? e.message : String(e)); derror("clipper:export", "FCPXML export failed", e); }
           }}
           className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-amber-500/50 bg-amber-950/30 hover:bg-amber-950/50 hover:border-amber-400 transition-all group"
         >
@@ -58,6 +73,10 @@ export default function ExportStep({ versionWords, source, transcript = [], spea
             <p className="text-xs text-amber-400/70 mt-0.5">
               {versionWords.length > 1
                 ? `${versionWords.length} files · one FCPXML per version`
+                : isLavAudio
+                ? isMultiCam
+                  ? "Host + Guest cams stacked · clean Host/Guest lav audio · cameras muted"
+                  : "Host cam · clean Host/Guest lav audio · camera muted"
                 : isMultiCam
                 ? "A on spine · B stacked on lane 1 · only A's audio plays"
                 : "FCPXML generated from your edits · ready to import"}

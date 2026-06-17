@@ -1,5 +1,6 @@
 import { getFrameTimeFormat } from "@/lib/clipper/timecode";
 import { Source } from "@/lib/clipper/types";
+import { dlog } from "@/lib/debug";
 
 function escapeXml(s: string): string {
   return s
@@ -21,14 +22,19 @@ function fileUrl(absPath: string): string {
 /**
  * Generate FCPXML 1.8 from kept segments.
  *
- * Audio channels follow `source.audioChannels`:
- *   - 2: channel-isolated stereo, srcCh=1 → speakerLabels[0] role, srcCh=2 → speakerLabels[1] role.
- *   - 1: mono (or cross-talk stereo downmixed to mono during transcription) — single srcCh=1.
+ * Two audio modes (source.audioMode):
+ *   - "camera" (default): the primary angle's own audio is routed via
+ *     `source.audioChannels` — 2 = channel-isolated stereo (srcCh=1 →
+ *     speakerLabels[0] role, srcCh=2 → speakerLabels[1] role); 1 = single srcCh=1.
+ *   - "lavs": the cameras' audio is MUTED and two clean lav files (lav1Path =
+ *     Host, lav2Path = Guest) are attached as connected audio-only clips on the
+ *     Host/Guest dialogue roles (lanes -1 / -2). Lavs are pre-synced to the
+ *     cameras, so their media in-point equals the camera's (segStart).
  *
- * A-only (source.angles.length === 1): flat <asset-clip> spine.
- * A+B (source.angles.length === 2): primary cam (audioSource:true) on the
- * spine; secondary cam as a lane-1 connected <asset-clip> child per segment.
- * Secondary has no <audio-channel-source> — only primary's audio plays.
+ * Video layout is unchanged by the audio mode:
+ *   A-only (angles.length === 1): flat <asset-clip> spine.
+ *   A+B (angles.length === 2): primary cam on the spine; secondary cam as a
+ *   lane-1 connected video clip per segment (secondary always silent).
  */
 export function generateFCPXML(
   segments: { start: number; end: number; text: string }[],
@@ -45,6 +51,20 @@ export function generateFCPXML(
   const secondary = source.angles.find((a) => !a.audioSource);
   const { duration, fps, audioChannels } = source;
 
+  // Lav mode requires both lav paths; fall back to camera audio if either is missing.
+  const lavMode = source.audioMode === "lavs" && !!source.lav1Path && !!source.lav2Path;
+
+  dlog("clipper:xml", "generateFCPXML", {
+    segments: segments.length,
+    angles: source.angles.length,
+    audioMode: source.audioMode ?? "camera",
+    lavMode,
+    audioChannels: source.audioChannels,
+    fps: source.fps,
+    duration: source.duration,
+    speakerLabels,
+  });
+
   const { frameDuration, frameNum, frameDenom } = getFrameTimeFormat(fps);
   const ch1Role = `dialogue.${sanitizeRole(speakerLabels?.[0] ?? "Speaker")}`;
   const ch2Role = `dialogue.${sanitizeRole(speakerLabels?.[1] ?? "Guest")}`;
@@ -54,10 +74,11 @@ export function generateFCPXML(
   const cleanName = trimmedSource.replace(/\.\w+$/, "").trim() || "export";
   const srcUrl = fileUrl(primary.filePath);
 
-  // Audio routing line(s) — channel-isolated stereo carries two distinct speaker
-  // roles; mono / cross-talk-downmixed sources have a single channel only.
-  const audioChannelLines =
-    audioChannels === 2
+  // Primary clip audio: camera mode routes the camera's own channels; lav mode
+  // mutes the camera (the clean audio comes from the connected lav clips below).
+  const primaryAudioInner = lavMode
+    ? `\n              <adjust-volume amount="-96dB" />`
+    : audioChannels === 2
       ? `\n              <audio-channel-source srcCh="1" role="${ch1Role}" />\n              <audio-channel-source srcCh="2" role="${ch2Role}" />`
       : `\n              <audio-channel-source srcCh="1" role="${ch1Role}" />`;
 
@@ -85,7 +106,13 @@ export function generateFCPXML(
         ? `\n              <asset-clip ref="r2" lane="1" offset="${startStr}" start="${startStr}" duration="${durStr}" />`
         : "";
 
-      return `            <asset-clip ref="r1" offset="${offsetStr}" name="${escapeXml(seg.text.trim().substring(0, 60))}" start="${startStr}" duration="${durStr}" tcFormat="NDF">${audioChannelLines}${bClipLine}
+      // Connected lav audio clips (lav mode only). Same source-TC window as the
+      // camera since lavs are pre-synced; routed to the Host/Guest dialogue roles.
+      const lavLines = lavMode
+        ? `\n              <asset-clip ref="rH" lane="-1" offset="${startStr}" name="Host Lav" start="${startStr}" duration="${durStr}" audioRole="${ch1Role}" />\n              <asset-clip ref="rG" lane="-2" offset="${startStr}" name="Guest Lav" start="${startStr}" duration="${durStr}" audioRole="${ch2Role}" />`
+        : "";
+
+      return `            <asset-clip ref="r1" offset="${offsetStr}" name="${escapeXml(seg.text.trim().substring(0, 60))}" start="${startStr}" duration="${durStr}" tcFormat="NDF">${primaryAudioInner}${bClipLine}${lavLines}
               <note>${escapeXml(seg.text)}</note>
             </asset-clip>`;
     })
@@ -95,7 +122,10 @@ export function generateFCPXML(
   const assetDurFrames = Math.ceil(duration * fps);
   const assetDurStr  = `${assetDurFrames * frameNum}/${frameDenom}s`;
 
-  const primaryAssetLine = `    <asset id="r1" name="${escapeXml(cleanName)}" src="${srcUrl}" start="0/${frameDenom}s" duration="${assetDurStr}" hasVideo="1" hasAudio="1" audioSources="${audioChannels}" audioChannels="${audioChannels}" audioRate="48000" format="r0" />`;
+  // In lav mode the primary's own audio is muted, so its channel count is
+  // irrelevant; advertise a single channel.
+  const primaryAudioChannels = lavMode ? 1 : audioChannels;
+  const primaryAssetLine = `    <asset id="r1" name="${escapeXml(cleanName)}" src="${srcUrl}" start="0/${frameDenom}s" duration="${assetDurStr}" hasVideo="1" hasAudio="1" audioSources="${primaryAudioChannels}" audioChannels="${primaryAudioChannels}" audioRate="48000" format="r0" />`;
 
   let secondaryAssetLine = "";
   if (secondary) {
@@ -105,12 +135,22 @@ export function generateFCPXML(
     secondaryAssetLine = `\n    <asset id="r2" name="${escapeXml(bCleanName)}" src="${bSrcUrl}" start="0/${frameDenom}s" duration="${assetDurStr}" hasVideo="1" hasAudio="0" format="r0" />`;
   }
 
+  // Lav audio assets (lav mode only): audio-only, one channel each.
+  let lavAssetLines = "";
+  if (lavMode) {
+    const hostName = (source.lav1Path!.split("/").pop() || "Host Lav").replace(/\.\w+$/, "").trim() || "Host Lav";
+    const guestName = (source.lav2Path!.split("/").pop() || "Guest Lav").replace(/\.\w+$/, "").trim() || "Guest Lav";
+    lavAssetLines =
+      `\n    <asset id="rH" name="${escapeXml(hostName)}" src="${fileUrl(source.lav1Path!)}" start="0/${frameDenom}s" duration="${assetDurStr}" hasVideo="0" hasAudio="1" audioSources="1" audioChannels="1" audioRate="48000" />` +
+      `\n    <asset id="rG" name="${escapeXml(guestName)}" src="${fileUrl(source.lav2Path!)}" start="0/${frameDenom}s" duration="${assetDurStr}" hasVideo="0" hasAudio="1" audioSources="1" audioChannels="1" audioRate="48000" />`;
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
 <fcpxml version="1.8">
   <resources>
     <format id="r0" frameDuration="${frameDuration}" width="1920" height="1080" />
-${primaryAssetLine}${secondaryAssetLine}
+${primaryAssetLine}${secondaryAssetLine}${lavAssetLines}
   </resources>
   <library>
     <event name="${escapeXml(cleanName)}">
