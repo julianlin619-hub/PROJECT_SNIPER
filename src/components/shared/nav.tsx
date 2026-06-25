@@ -9,6 +9,12 @@ const TOOLS = [
   { href: "/polisher", label: "POLISHER", hint: "03", soon: true },
 ] as const;
 
+// Auxiliary utilities — set apart from the three numbered pipeline stages and
+// rendered smaller. FRAME.IO REVIEW is a standalone QC pass, not a pipeline step.
+const UTILS = [
+  { href: "/frameio-review", label: "FRAME.IO REVIEW", hint: "QC", soon: false },
+] as const;
+
 export default function Nav() {
   const pathname = usePathname();
 
@@ -66,6 +72,34 @@ export default function Nav() {
                   {t.hint}
                 </span>
                 <span className="label">{t.label}</span>
+                {active && (
+                  <span className="absolute inset-x-2 -bottom-3 h-px bg-signal" />
+                )}
+              </Link>
+            );
+          })}
+
+          {/* Auxiliary utilities — divider, then smaller secondary tabs. */}
+          <span aria-hidden className="mx-1 h-4 w-px bg-border" />
+          {UTILS.map((u) => {
+            const active = pathname.startsWith(u.href);
+            return (
+              <Link
+                key={u.href}
+                href={u.href}
+                aria-current={active ? "page" : undefined}
+                className={`group relative flex items-center gap-1.5 px-2 py-1.5 transition-colors ${
+                  active ? "text-foreground" : "text-muted-foreground/80 hover:text-foreground"
+                }`}
+              >
+                <span
+                  className={`font-mono text-[9px] tabular-nums ${
+                    active ? "text-signal" : "text-muted-foreground/40"
+                  }`}
+                >
+                  {u.hint}
+                </span>
+                <span className="label text-[10px]">{u.label}</span>
                 {active && (
                   <span className="absolute inset-x-2 -bottom-3 h-px bg-signal" />
                 )}

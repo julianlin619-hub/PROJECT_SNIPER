@@ -4,3 +4,10 @@ deepgram-sdk>=6.0.0
 scipy
 # CLIPPER transcribe stereo-channel isolation (scripts/clipper_transcribe.py) + multicam
 numpy>=1.26
+# FRAME.IO REVIEW on-screen-text QC (scripts/frameio/*): perceptual-hash dedup + Claude vision
+Pillow>=10.0
+imagehash>=4.3
+anthropic>=0.40
+# FRAME.IO REVIEW OCR-selector mode (scripts/frameio/ocr_dedup.py): needs system `tesseract` on PATH
+pytesseract>=0.3.10
+rapidfuzz>=3.0

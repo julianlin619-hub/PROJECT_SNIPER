@@ -182,6 +182,29 @@ export default function Home() {
           })}
         </section>
 
+        {/* Auxiliary utility — not a pipeline stage; a standalone QC pass. */}
+        <section className="pb-10">
+          <Link
+            href="/frameio-review"
+            className="group flex items-center justify-between rounded-lg border border-dashed border-border bg-card/30 px-5 py-4 transition-colors hover:border-signal/50 hover:bg-card/60"
+          >
+            <div className="flex items-center gap-3">
+              <span className="label rounded-full border border-border px-2 py-0.5 text-[10px] text-signal/80">
+                QC
+              </span>
+              <div>
+                <span className="label text-foreground">FRAME.IO REVIEW</span>
+                <span className="ml-3 text-sm text-muted-foreground">
+                  Scan an MP4 for on-screen text errors — typos, spelling, grammar.
+                </span>
+              </div>
+            </div>
+            <span className="text-foreground/60 transition-transform duration-300 group-hover:translate-x-1.5 group-hover:text-signal">
+              →
+            </span>
+          </Link>
+        </section>
+
         {/* Readout footer */}
         <footer className="flex items-center justify-between border-t border-border py-5">
           <span className="label text-muted-foreground/60">

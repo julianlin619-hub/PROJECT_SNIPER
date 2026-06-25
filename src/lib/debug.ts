@@ -6,9 +6,9 @@
 // terminal). The matching Python flag is SNIPER_DEBUG (stderr), see scripts/.
 //
 // TERMINAL VISIBILITY: client logs normally only reach the browser console. For
-// CLIPPER scopes ("clipper:*") we ALSO POST each event to /api/clipper/debug-log
-// so the dev-server terminal shows the WHOLE flow (client + server + python) in
-// one place. This forwarding is intentionally limited to clipper scopes.
+// CLIPPER scopes ("clipper:*") and FRAME.IO REVIEW scopes ("frameio:*") we ALSO
+// POST each event to the matching /api/*/debug-log route so the dev-server
+// terminal shows the WHOLE flow (client + server + python) in one place.
 //
 // Lines look like:  [SNIPER 12:01:03.412 client clipper:browse] picked Host camera { ... }
 
@@ -59,10 +59,16 @@ function errToObj(err: unknown): unknown {
   return err;
 }
 
-// Client → dev-terminal forwarder. Best-effort, never throws, clipper scopes only.
+// Client → dev-terminal forwarder. Best-effort, never throws. Limited to the two
+// tools that opt into full end-to-end terminal tracing (CLIPPER + FRAME.IO REVIEW).
 function forwardToTerminal(scope: string, event: string, data?: unknown): void {
   if (typeof window === "undefined") return;        // server already prints to terminal
-  if (!scope.startsWith("clipper")) return;          // just for CLIPPER, per request
+  const endpoint = scope.startsWith("clipper")
+    ? "/api/clipper/debug-log"
+    : scope.startsWith("frameio")
+      ? "/api/frameio-review/debug-log"
+      : null;
+  if (!endpoint) return;
   try {
     let safeData: unknown = data;
     try {
@@ -72,9 +78,9 @@ function forwardToTerminal(scope: string, event: string, data?: unknown): void {
     }
     const body = JSON.stringify({ scope, event, data: safeData, t: stamp() });
     if (navigator.sendBeacon) {
-      navigator.sendBeacon("/api/clipper/debug-log", new Blob([body], { type: "application/json" }));
+      navigator.sendBeacon(endpoint, new Blob([body], { type: "application/json" }));
     } else {
-      void fetch("/api/clipper/debug-log", {
+      void fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
